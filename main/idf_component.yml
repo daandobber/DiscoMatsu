@@ -1,0 +1,6 @@
+dependencies:
+  idf: ">=5.5.1"
+  badgeteam/badge-bsp: "^0.9.9"
+  robotman2412/pax-gfx: "^2.1.0"
+  nicolaielectronics/tanmatsu-wifi: "^1.1.2"
+  esp_jpeg: ">=1.0.2"
