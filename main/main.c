@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <math.h>
+
 #include "bsp/device.h"
 #include "bsp/display.h"
 #include "bsp/input.h"
@@ -31,6 +33,7 @@ static const char TAG[] = "discmatsu";
 #define TERM_RED   0xFFFF5555
 #define TERM_SELECT_BG 0xFF103318
 #define FONT_SIZE  16.0f
+#define TAU        6.28318530718f
 
 static pax_buf_t fb = {0};
 static size_t display_h_res = 0;
@@ -91,6 +94,14 @@ static void draw_box(float x, float y, float w, float h, pax_col_t color, const 
 
 static void format_mmss(uint32_t total_seconds, char *out, size_t out_len) {
     snprintf(out, out_len, "%02u:%02u", (unsigned)(total_seconds / 60), (unsigned)(total_seconds % 60));
+}
+
+static void draw_centered_text(const char *text, pax_col_t color, float size, float y) {
+    float w = pax_buf_get_width(&fb);
+    pax_vec2f text_size = pax_text_size(pax_font_sky_mono, size, text);
+    float x = (w - text_size.x) / 2;
+    if (x < 8) x = 8;
+    pax_draw_text(&fb, color, pax_font_sky_mono, size, x, y, text);
 }
 
 static char *lastfm_field_buffer(int field, size_t *out_len) {
@@ -193,6 +204,74 @@ static void update_lastfm_from_playback(void) {
     lastfm_was_playing = play_state.playing;
 }
 
+static void render_rip_focus(float w, float h, const cd_metadata_status_t *meta, const cd_ripper_status_t *rip) {
+    pax_background(&fb, BLACK);
+
+    draw_centered_text("RIPPING CD", TERM_GREEN, FONT_SIZE + 12.0f, 18);
+
+    char album_line[200];
+    if (meta->album[0] != '\0') {
+        snprintf(album_line, sizeof(album_line), "%.80s - %.80s", meta->artist[0] ? meta->artist : "Unknown Artist", meta->album);
+    } else {
+        snprintf(album_line, sizeof(album_line), "Writing WAV files to SD");
+    }
+    draw_centered_text(album_line, TERM_DIM, FONT_SIZE, 18 + g_line_h * 1.6f);
+
+    float cx = w / 2;
+    float cy = h / 2 - 18;
+    float radius = h < w ? h * 0.24f : w * 0.24f;
+    if (radius < 88) radius = 88;
+    if (radius > 136) radius = 136;
+    float ring_outer = radius;
+    float ring_inner = radius - 12;
+
+    pax_draw_hollow_circle(&fb, 0xFF263026, cx, cy, ring_inner, ring_outer);
+    uint32_t pct = rip->current_percent;
+    if (pct > 100) pct = 100;
+    if (pct > 0) {
+        float start = -TAU / 4.0f;
+        float end = start + TAU * ((float)pct / 100.0f);
+        pax_draw_round_hollow_arc(&fb, TERM_GREEN, cx, cy, ring_inner, ring_outer, start, end);
+    }
+
+    bool show_art = meta->cover_art_rgb565 != NULL && meta->cover_art_width > 0 && meta->cover_art_height > 0;
+    if (show_art) {
+        pax_buf_t art_buf = {0};
+        pax_buf_init(
+            &art_buf, (void *)meta->cover_art_rgb565, meta->cover_art_width, meta->cover_art_height, PAX_BUF_16_565RGB
+        );
+        pax_blit(&fb, &art_buf, (int)(cx - meta->cover_art_width / 2), (int)(cy - meta->cover_art_height / 2));
+    } else {
+        pax_draw_hollow_circle(&fb, TERM_DIM, cx, cy, radius * 0.45f, radius * 0.47f);
+        draw_centered_text("NO ART", TERM_DIM, FONT_SIZE, cy - g_line_h / 2);
+    }
+
+    char percent_line[32];
+    snprintf(percent_line, sizeof(percent_line), "%lu%%", (unsigned long)pct);
+    draw_centered_text(percent_line, TERM_GREEN, FONT_SIZE + 10.0f, cy + radius + 18);
+
+    char track_line[180];
+    if (rip->state == CD_RIPPER_STATE_MOUNTING_SD) {
+        snprintf(track_line, sizeof(track_line), "Preparing SD card...");
+    } else {
+        const char *title = "Track";
+        int title_index = rip->current_track - 1;
+        if (title_index >= 0 && title_index < meta->track_title_count && meta->track_titles[title_index][0] != '\0') {
+            title = meta->track_titles[title_index];
+        }
+        snprintf(track_line, sizeof(track_line), "Track %d/%d: %.100s", rip->current_track, rip->total_tracks, title);
+    }
+    draw_centered_text(track_line, TERM_FG, FONT_SIZE + 4.0f, cy + radius + 18 + g_line_h * 1.6f);
+
+    if (rip->current_path[0] != '\0') {
+        char path_line[180];
+        snprintf(path_line, sizeof(path_line), "%.160s", rip->current_path);
+        draw_centered_text(path_line, TERM_DIM, FONT_SIZE - 2.0f, h - g_line_h * 2.0f);
+    }
+    draw_centered_text("Please wait", TERM_DIM, FONT_SIZE, h - g_line_h);
+    blit();
+}
+
 static void render(void) {
     pax_background(&fb, BLACK);
 
@@ -207,6 +286,13 @@ static void render(void) {
     cdplayer_get_state(&play_state);
     static cd_metadata_status_t meta;
     cd_metadata_get_status(&meta);
+    cd_ripper_status_t rip;
+    cd_ripper_get_status(&rip);
+
+    if (rip.state == CD_RIPPER_STATE_MOUNTING_SD || rip.state == CD_RIPPER_STATE_RIPPING) {
+        render_rip_focus(w, h, &meta, &rip);
+        return;
+    }
 
     pax_draw_text(&fb, TERM_GREEN, pax_font_sky_mono, FONT_SIZE + 4.0f, 16, 12, "Disc-O-Matsu");
 
@@ -285,8 +371,6 @@ static void render(void) {
         pax_draw_text(&fb, color, pax_font_sky_mono, FONT_SIZE, 32, ry, line);
     }
 
-    cd_ripper_status_t rip;
-    cd_ripper_get_status(&rip);
     wifi_file_server_status_t files;
     wifi_file_server_get_status(&files);
     char rip_line[160];
