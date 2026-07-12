@@ -21,6 +21,9 @@ typedef struct {
     cd_metadata_state_t state;
     char album[96];
     char artist[96];
+    char year[8];
+    int disc_number;
+    int disc_count;
     char track_titles[CDROM_AUDIO_MAX_TRACKS][64];
     int track_title_count;
     const uint16_t *cover_art_rgb565;  // NULL if none available

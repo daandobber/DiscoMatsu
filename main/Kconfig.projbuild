@@ -1,0 +1,27 @@
+menu "Disc-O-Matsu"
+
+    config DISCOMATSU_LASTFM_API_KEY
+        string "Last.fm API key"
+        default ""
+        help
+            API key from https://www.last.fm/api/account/create. Leave empty to disable Last.fm scrobbling.
+
+    config DISCOMATSU_LASTFM_API_SECRET
+        string "Last.fm shared secret"
+        default ""
+        help
+            Shared secret for the Last.fm API key. Leave empty to disable Last.fm scrobbling.
+
+    config DISCOMATSU_LASTFM_BOOTSTRAP_USERNAME
+        string "Last.fm bootstrap username"
+        default ""
+        help
+            Optional first-run username. If no saved session exists, Disc-O-Matsu will use this once to request a session.
+
+    config DISCOMATSU_LASTFM_BOOTSTRAP_PASSWORD
+        string "Last.fm bootstrap password"
+        default ""
+        help
+            Optional first-run password. It is only used to request a Last.fm session and is not saved in NVS.
+
+endmenu

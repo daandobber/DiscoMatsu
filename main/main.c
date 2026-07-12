@@ -5,6 +5,7 @@
 #include "bsp/display.h"
 #include "bsp/input.h"
 #include "cd_metadata.h"
+#include "cd_ripper.h"
 #include "cdplayer_task.h"
 #include "cdrom_audio.h"
 #include "audio_output.h"
@@ -17,6 +18,7 @@
 #include "pax_gfx.h"
 #include "pax_text.h"
 #include "pax_types.h"
+#include "lastfm_scrobbler.h"
 #include "wifi_setup.h"
 
 static const char TAG[] = "discmatsu";
@@ -41,6 +43,8 @@ static float g_line_h = 20.0f;
 static int track_selected = 0;
 static int track_scroll = 0;
 static bool show_exit_menu = false;
+static int lastfm_track_index = -1;
+static bool lastfm_was_playing = false;
 
 static void blit(void) {
     esp_err_t res = bsp_display_blit(0, 0, display_h_res, display_v_res, pax_buf_get_pixels(&fb));
@@ -68,6 +72,51 @@ static void draw_box(float x, float y, float w, float h, pax_col_t color, const 
 
 static void format_mmss(uint32_t total_seconds, char *out, size_t out_len) {
     snprintf(out, out_len, "%02u:%02u", (unsigned)(total_seconds / 60), (unsigned)(total_seconds % 60));
+}
+
+static void build_lastfm_track_info(
+    const cdrom_status_t *cd_status, const cd_metadata_status_t *meta, int track_index, lastfm_track_info_t *out
+) {
+    static char fallback_title[24];
+    memset(out, 0, sizeof(*out));
+    if (track_index < 0 || track_index >= cd_status->track_count) return;
+
+    const cdrom_track_t *track = &cd_status->tracks[track_index];
+    snprintf(fallback_title, sizeof(fallback_title), "Track %02d", track->number);
+    out->artist = meta->artist;
+    out->album = meta->album;
+    out->track = (track_index < meta->track_title_count && meta->track_titles[track_index][0] != '\0')
+                     ? meta->track_titles[track_index]
+                     : fallback_title;
+    out->track_number = track->number;
+    out->duration_sec = (track->end_lba - track->start_lba) / CDROM_AUDIO_SECTORS_PER_SEC;
+}
+
+static void update_lastfm_from_playback(void) {
+    static cdrom_status_t cd_status;
+    static cd_metadata_status_t meta;
+    cdplayer_state_t play_state;
+    cdrom_audio_get_status(&cd_status);
+    cd_metadata_get_status(&meta);
+    cdplayer_get_state(&play_state);
+
+    bool track_changed = play_state.track_index != lastfm_track_index || (play_state.playing && !lastfm_was_playing);
+    if (track_changed) {
+        lastfm_scrobbler_track_changed();
+        lastfm_track_index = play_state.track_index;
+        if (play_state.playing && !play_state.paused) {
+            lastfm_track_info_t info;
+            build_lastfm_track_info(&cd_status, &meta, play_state.track_index, &info);
+            lastfm_scrobbler_now_playing(&info);
+        }
+    }
+
+    if (play_state.playing && !play_state.paused) {
+        lastfm_track_info_t info;
+        build_lastfm_track_info(&cd_status, &meta, play_state.track_index, &info);
+        lastfm_scrobbler_maybe_scrobble(&info, play_state.elapsed_sec);
+    }
+    lastfm_was_playing = play_state.playing;
 }
 
 static void render(void) {
@@ -118,7 +167,7 @@ static void render(void) {
 
     float header_h = show_art && art_size > g_line_h * 2 ? art_size : g_line_h * 2;
     float list_y   = 12 + header_h + 12;
-    float list_h   = h - list_y - g_line_h * 2 - 16;
+    float list_h   = h - list_y - g_line_h * 3 - 16;
     draw_box(16, list_y, w - 32, list_h, TERM_GREEN, "Tracks");
 
     int visible_rows = (int)((list_h - g_line_h) / g_line_h);
@@ -162,7 +211,33 @@ static void render(void) {
         pax_draw_text(&fb, color, pax_font_sky_mono, FONT_SIZE, 32, ry, line);
     }
 
-    char footer[110];
+    cd_ripper_status_t rip;
+    cd_ripper_get_status(&rip);
+    char rip_line[160];
+    switch (rip.state) {
+        case CD_RIPPER_STATE_MOUNTING_SD:
+            snprintf(rip_line, sizeof(rip_line), "Rip: mounting SD card...");
+            break;
+        case CD_RIPPER_STATE_RIPPING:
+            snprintf(
+                rip_line, sizeof(rip_line), "Rip: track %d/%d %lu%%", rip.current_track, rip.total_tracks,
+                (unsigned long)rip.current_percent
+            );
+            break;
+        case CD_RIPPER_STATE_DONE:
+            snprintf(rip_line, sizeof(rip_line), "Rip done: %.140s", rip.current_path);
+            break;
+        case CD_RIPPER_STATE_ERROR:
+            snprintf(rip_line, sizeof(rip_line), "Rip error: %s", rip.last_error);
+            break;
+        case CD_RIPPER_STATE_IDLE:
+        default:
+            snprintf(rip_line, sizeof(rip_line), "F3=Rip WAV to SD");
+            break;
+    }
+    pax_draw_text(&fb, rip.state == CD_RIPPER_STATE_ERROR ? TERM_RED : TERM_DIM, pax_font_sky_mono, FONT_SIZE, 16, h - g_line_h * 2, rip_line);
+
+    char footer[120];
     if (play_state.playing) {
         char elapsed[16], total[16];
         format_mmss(play_state.elapsed_sec, elapsed, sizeof(elapsed));
@@ -249,6 +324,15 @@ static bool handle_input(bsp_input_event_t *event) {
         case BSP_INPUT_NAVIGATION_KEY_F2:
             cdrom_audio_eject();
             return true;
+        case BSP_INPUT_NAVIGATION_KEY_F3: {
+            if (cd_ripper_is_active()) return false;
+            if (play_state.playing) cdplayer_stop();
+            static cd_metadata_status_t meta;
+            cd_metadata_get_status(&meta);
+            esp_err_t res = cd_ripper_start(&cd_status, &meta);
+            if (res != ESP_OK) ESP_LOGW(TAG, "Rip start failed: %s", esp_err_to_name(res));
+            return true;
+        }
         case BSP_INPUT_NAVIGATION_KEY_ESC:
             show_exit_menu = true;
             return true;
@@ -319,9 +403,11 @@ void app_main(void) {
     blit();
 
     ESP_ERROR_CHECK(wifi_setup_init());
+    ESP_ERROR_CHECK(lastfm_scrobbler_init());
     ESP_ERROR_CHECK(cd_metadata_init());
     ESP_ERROR_CHECK(cdrom_audio_init());
     ESP_ERROR_CHECK(cdplayer_task_init());
+    ESP_ERROR_CHECK(cd_ripper_init());
 
     render();
 
@@ -334,8 +420,13 @@ void app_main(void) {
         }
 
         if (cdrom_audio_consume_dirty()) need_redraw = true;
-        if (cdplayer_consume_dirty()) need_redraw = true;
+        if (cdplayer_consume_dirty()) {
+            update_lastfm_from_playback();
+            need_redraw = true;
+        }
         if (cd_metadata_consume_dirty()) need_redraw = true;
+        if (lastfm_scrobbler_consume_dirty()) need_redraw = true;
+        if (cd_ripper_consume_dirty()) need_redraw = true;
 
         if (need_redraw) render();
     }

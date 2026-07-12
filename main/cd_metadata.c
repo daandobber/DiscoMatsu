@@ -349,6 +349,7 @@ static void lookup_task(void *arg) {
     cJSON *title          = cJSON_GetObjectItem(release, "title");
     cJSON *artist_credit  = cJSON_GetObjectItem(release, "artist-credit");
     cJSON *release_id     = cJSON_GetObjectItem(release, "id");
+    cJSON *date           = cJSON_GetObjectItem(release, "date");
     cJSON *media          = cJSON_GetObjectItem(release, "media");
 
     char release_mbid[64] = {0};
@@ -357,17 +358,26 @@ static void lookup_task(void *arg) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     memset(s_status.album, 0, sizeof(s_status.album));
     memset(s_status.artist, 0, sizeof(s_status.artist));
+    memset(s_status.year, 0, sizeof(s_status.year));
     memset(s_status.track_titles, 0, sizeof(s_status.track_titles));
     s_status.track_title_count = 0;
+    s_status.disc_number = 0;
+    s_status.disc_count = 0;
 
     if (cJSON_IsString(title)) snprintf(s_status.album, sizeof(s_status.album), "%s", title->valuestring);
+    if (cJSON_IsString(date) && strlen(date->valuestring) >= 4) {
+        snprintf(s_status.year, sizeof(s_status.year), "%.4s", date->valuestring);
+    }
     if (cJSON_IsArray(artist_credit) && cJSON_GetArraySize(artist_credit) > 0) {
         cJSON *first_artist = cJSON_GetArrayItem(artist_credit, 0);
         cJSON *name         = cJSON_GetObjectItem(first_artist, "name");
         if (cJSON_IsString(name)) snprintf(s_status.artist, sizeof(s_status.artist), "%s", name->valuestring);
     }
     if (cJSON_IsArray(media) && cJSON_GetArraySize(media) > 0) {
+        s_status.disc_count = cJSON_GetArraySize(media);
         cJSON *first_medium = cJSON_GetArrayItem(media, 0);
+        cJSON *position      = cJSON_GetObjectItem(first_medium, "position");
+        if (cJSON_IsNumber(position)) s_status.disc_number = position->valueint;
         cJSON *track_list    = cJSON_GetObjectItem(first_medium, "tracks");
         if (cJSON_IsArray(track_list)) {
             int n = cJSON_GetArraySize(track_list);

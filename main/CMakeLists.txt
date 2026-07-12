@@ -9,12 +9,18 @@ idf_component_register(
 		"usb_msc_scsi.c"
 		"cdrom_audio.c"
 		"cdplayer_task.c"
+		"cd_ripper.c"
+		"sd_storage.c"
 		"wifi_setup.c"
 		"cd_metadata.c"
+		"lastfm_scrobbler.c"
 		"main.c"
 	PRIV_REQUIRES
 		esp_lcd
 		nvs_flash
+		fatfs
+		sdmmc
+		esp_driver_sdmmc
 		badge-bsp
 		usb
 		esp_driver_i2s

@@ -36,13 +36,16 @@ static volatile bool s_dirty            = false;
 
 static void publish_state(bool playing, bool paused, int track_index, uint32_t elapsed_sec, uint32_t total_sec) {
     xSemaphoreTake(s_state_mutex, portMAX_DELAY);
+    bool changed =
+        s_state.playing != playing || s_state.paused != paused || s_state.track_index != track_index ||
+        s_state.elapsed_sec != elapsed_sec || s_state.total_sec != total_sec;
     s_state.playing     = playing;
     s_state.paused      = paused;
     s_state.track_index = track_index;
     s_state.elapsed_sec = elapsed_sec;
     s_state.total_sec   = total_sec;
     xSemaphoreGive(s_state_mutex);
-    s_dirty = true;
+    if (changed) s_dirty = true;
 }
 
 static bool find_next_audio_track(const cdrom_status_t *status, int from_index, int step, int *out_index) {
