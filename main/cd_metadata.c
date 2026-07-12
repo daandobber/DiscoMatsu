@@ -86,6 +86,60 @@ static void compute_musicbrainz_discid(const cdrom_track_t *tracks, int track_co
     snprintf(out_discid, out_cap, "%s", (const char *)b64);
 }
 
+static void build_musicbrainz_toc(const cdrom_track_t *tracks, int track_count, char *out_toc, size_t out_cap) {
+    out_toc[0] = '\0';
+    if (track_count <= 0) return;
+
+    int pos = snprintf(
+        out_toc, out_cap, "%u+%u+%lu", (unsigned)tracks[0].number, (unsigned)tracks[track_count - 1].number,
+        (unsigned long)(tracks[track_count - 1].end_lba + 150)
+    );
+    if (pos < 0 || pos >= (int)out_cap) {
+        out_toc[0] = '\0';
+        return;
+    }
+
+    for (int i = 0; i < track_count; i++) {
+        pos += snprintf(out_toc + pos, out_cap - (size_t)pos, "+%lu", (unsigned long)(tracks[i].start_lba + 150));
+        if (pos < 0 || pos >= (int)out_cap) {
+            out_toc[0] = '\0';
+            return;
+        }
+    }
+}
+
+static cJSON *find_best_medium(cJSON *release, int track_count) {
+    cJSON *media = cJSON_GetObjectItem(release, "media");
+    if (!cJSON_IsArray(media) || cJSON_GetArraySize(media) == 0) return NULL;
+
+    cJSON *fallback = cJSON_GetArrayItem(media, 0);
+    int media_count = cJSON_GetArraySize(media);
+    for (int i = 0; i < media_count; i++) {
+        cJSON *medium = cJSON_GetArrayItem(media, i);
+        cJSON *tracks = cJSON_GetObjectItem(medium, "tracks");
+        if (cJSON_IsArray(tracks) && cJSON_GetArraySize(tracks) == track_count) return medium;
+    }
+    return fallback;
+}
+
+static cJSON *find_best_release(cJSON *releases, int track_count, cJSON **out_medium) {
+    *out_medium = NULL;
+    int release_count = cJSON_GetArraySize(releases);
+    for (int i = 0; i < release_count; i++) {
+        cJSON *release = cJSON_GetArrayItem(releases, i);
+        cJSON *medium = find_best_medium(release, track_count);
+        cJSON *tracks = medium ? cJSON_GetObjectItem(medium, "tracks") : NULL;
+        if (cJSON_IsArray(tracks) && cJSON_GetArraySize(tracks) == track_count) {
+            *out_medium = medium;
+            return release;
+        }
+    }
+
+    cJSON *release = cJSON_GetArrayItem(releases, 0);
+    *out_medium = release ? find_best_medium(release, track_count) : NULL;
+    return release;
+}
+
 typedef struct {
     uint8_t *buf;
     size_t len;
@@ -309,9 +363,13 @@ static void lookup_task(void *arg) {
     compute_musicbrainz_discid(req->tracks, req->track_count, discid, sizeof(discid));
     ESP_LOGI(TAG, "MusicBrainz disc ID: %s", discid);
 
-    char url[192];
+    char toc[1024];
+    build_musicbrainz_toc(req->tracks, req->track_count, toc, sizeof(toc));
+
+    char url[1400];
     snprintf(
-        url, sizeof(url), "https://musicbrainz.org/ws/2/discid/%s?fmt=json&inc=recordings+artist-credits", discid
+        url, sizeof(url), "https://musicbrainz.org/ws/2/discid/%s?fmt=json&cdstubs=no&toc=%s&inc=recordings+artist-credits",
+        discid, toc
     );
 
     buf = heap_caps_malloc(HTTP_BUF_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -345,7 +403,8 @@ static void lookup_task(void *arg) {
         goto done;
     }
 
-    cJSON *release        = cJSON_GetArrayItem(releases, 0);
+    cJSON *selected_medium = NULL;
+    cJSON *release        = find_best_release(releases, req->track_count, &selected_medium);
     cJSON *title          = cJSON_GetObjectItem(release, "title");
     cJSON *artist_credit  = cJSON_GetObjectItem(release, "artist-credit");
     cJSON *release_id     = cJSON_GetObjectItem(release, "id");
@@ -375,10 +434,9 @@ static void lookup_task(void *arg) {
     }
     if (cJSON_IsArray(media) && cJSON_GetArraySize(media) > 0) {
         s_status.disc_count = cJSON_GetArraySize(media);
-        cJSON *first_medium = cJSON_GetArrayItem(media, 0);
-        cJSON *position      = cJSON_GetObjectItem(first_medium, "position");
+        cJSON *position      = cJSON_GetObjectItem(selected_medium, "position");
         if (cJSON_IsNumber(position)) s_status.disc_number = position->valueint;
-        cJSON *track_list    = cJSON_GetObjectItem(first_medium, "tracks");
+        cJSON *track_list    = cJSON_GetObjectItem(selected_medium, "tracks");
         if (cJSON_IsArray(track_list)) {
             int n = cJSON_GetArraySize(track_list);
             if (n > CDROM_AUDIO_MAX_TRACKS) n = CDROM_AUDIO_MAX_TRACKS;
