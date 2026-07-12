@@ -44,6 +44,8 @@ typedef struct {
     char username[64];
     char password[96];
     char session_key[64];
+    char api_key[80];
+    char api_secret[80];
     int track_number;
     uint32_t duration_sec;
     uint32_t timestamp;
@@ -58,12 +60,14 @@ typedef struct {
 static SemaphoreHandle_t s_mutex = NULL;
 static char s_session_key[64]    = "";
 static char s_username[64]       = "";
+static char s_api_key[80]        = CONFIG_DISCOMATSU_LASTFM_API_KEY;
+static char s_api_secret[80]     = CONFIG_DISCOMATSU_LASTFM_API_SECRET;
 static char s_last_error[96]     = "";
 static bool s_scrobbled_current  = false;
 static volatile bool s_dirty     = false;
 
 static bool api_configured(void) {
-    return CONFIG_DISCOMATSU_LASTFM_API_KEY[0] != '\0' && CONFIG_DISCOMATSU_LASTFM_API_SECRET[0] != '\0';
+    return s_api_key[0] != '\0' && s_api_secret[0] != '\0';
 }
 
 static void set_error(const char *fmt, ...) {
@@ -103,6 +107,26 @@ static esp_err_t load_session(void) {
         return ESP_OK;
     }
     return ESP_ERR_NOT_FOUND;
+}
+
+static void load_api_credentials(void) {
+    nvs_handle_t nvs;
+    if (nvs_open("lastfm", NVS_READONLY, &nvs) != ESP_OK) return;
+
+    char api_key[80] = "";
+    char api_secret[80] = "";
+    size_t api_key_len = sizeof(api_key);
+    size_t api_secret_len = sizeof(api_secret);
+    esp_err_t key_res = nvs_get_str(nvs, "api_key", api_key, &api_key_len);
+    esp_err_t secret_res = nvs_get_str(nvs, "api_secret", api_secret, &api_secret_len);
+    nvs_close(nvs);
+
+    if (key_res == ESP_OK && secret_res == ESP_OK) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        snprintf(s_api_key, sizeof(s_api_key), "%s", api_key);
+        snprintf(s_api_secret, sizeof(s_api_secret), "%s", api_secret);
+        xSemaphoreGive(s_mutex);
+    }
 }
 
 static esp_err_t save_session(const char *username, const char *session_key) {
@@ -182,11 +206,11 @@ static void md5_hex(const char *input, char out[33]) {
     out[32] = '\0';
 }
 
-static void sign_auth(const char *username, const char *password, char out[33]) {
+static void sign_auth(const lastfm_request_t *req, char out[33]) {
     char sig_src[384];
     snprintf(
         sig_src, sizeof(sig_src), "api_key%smethodauth.getMobileSessionpassword%susername%s%s",
-        CONFIG_DISCOMATSU_LASTFM_API_KEY, password, username, CONFIG_DISCOMATSU_LASTFM_API_SECRET
+        req->api_key, req->password, req->username, req->api_secret
     );
     md5_hex(sig_src, out);
 }
@@ -197,15 +221,15 @@ static void sign_track(const lastfm_request_t *req, char out[33]) {
         snprintf(
             sig_src, sizeof(sig_src),
             "album%sapi_key%sartist%sduration%umethodtrack.scrobblesk%stimestamp%utrack%strackNumber%d%s",
-            req->album, CONFIG_DISCOMATSU_LASTFM_API_KEY, req->artist, (unsigned)req->duration_sec, req->session_key,
-            (unsigned)req->timestamp, req->track, req->track_number, CONFIG_DISCOMATSU_LASTFM_API_SECRET
+            req->album, req->api_key, req->artist, (unsigned)req->duration_sec, req->session_key,
+            (unsigned)req->timestamp, req->track, req->track_number, req->api_secret
         );
     } else {
         snprintf(
             sig_src, sizeof(sig_src),
             "album%sapi_key%sartist%sduration%umethodtrack.updateNowPlayingsk%strack%strackNumber%d%s",
-            req->album, CONFIG_DISCOMATSU_LASTFM_API_KEY, req->artist, (unsigned)req->duration_sec, req->session_key,
-            req->track, req->track_number, CONFIG_DISCOMATSU_LASTFM_API_SECRET
+            req->album, req->api_key, req->artist, (unsigned)req->duration_sec, req->session_key, req->track,
+            req->track_number, req->api_secret
         );
     }
     md5_hex(sig_src, out);
@@ -244,11 +268,11 @@ static void request_task(void *arg) {
     int pos = 0;
 
     if (strcmp(req->method, "auth.getMobileSession") == 0) {
-        sign_auth(req->username, req->password, api_sig);
+        sign_auth(req, api_sig);
         pos = append_pair(body, sizeof(body), pos, "method", "auth.getMobileSession");
         pos = append_pair(body, sizeof(body), pos, "username", req->username);
         pos = append_pair(body, sizeof(body), pos, "password", req->password);
-        pos = append_pair(body, sizeof(body), pos, "api_key", CONFIG_DISCOMATSU_LASTFM_API_KEY);
+        pos = append_pair(body, sizeof(body), pos, "api_key", req->api_key);
         pos = append_pair(body, sizeof(body), pos, "api_sig", api_sig);
         pos = append_pair(body, sizeof(body), pos, "format", "json");
     } else {
@@ -262,7 +286,7 @@ static void request_task(void *arg) {
         if (strcmp(req->method, "track.scrobble") == 0) {
             pos = append_pair_u32(body, sizeof(body), pos, "timestamp", req->timestamp);
         }
-        pos = append_pair(body, sizeof(body), pos, "api_key", CONFIG_DISCOMATSU_LASTFM_API_KEY);
+        pos = append_pair(body, sizeof(body), pos, "api_key", req->api_key);
         pos = append_pair(body, sizeof(body), pos, "sk", req->session_key);
         pos = append_pair(body, sizeof(body), pos, "api_sig", api_sig);
         pos = append_pair(body, sizeof(body), pos, "format", "json");
@@ -310,6 +334,8 @@ static bool fill_track_request(lastfm_request_t *req, const char *method, const 
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     bool ok = s_session_key[0] != '\0';
     snprintf(req->session_key, sizeof(req->session_key), "%s", s_session_key);
+    snprintf(req->api_key, sizeof(req->api_key), "%s", s_api_key);
+    snprintf(req->api_secret, sizeof(req->api_secret), "%s", s_api_secret);
     xSemaphoreGive(s_mutex);
     if (!ok) return false;
 
@@ -327,6 +353,7 @@ esp_err_t lastfm_scrobbler_init(void) {
     s_mutex = xSemaphoreCreateMutex();
     if (s_mutex == NULL) return ESP_ERR_NO_MEM;
 
+    load_api_credentials();
     load_session();
     if (api_configured() && s_session_key[0] == '\0' && CONFIG_DISCOMATSU_LASTFM_BOOTSTRAP_USERNAME[0] != '\0' &&
         CONFIG_DISCOMATSU_LASTFM_BOOTSTRAP_PASSWORD[0] != '\0') {
@@ -335,6 +362,38 @@ esp_err_t lastfm_scrobbler_init(void) {
         );
     }
     return ESP_OK;
+}
+
+esp_err_t lastfm_scrobbler_set_api_credentials(const char *api_key, const char *api_secret) {
+    if (api_key == NULL || api_secret == NULL || api_key[0] == '\0' || api_secret[0] == '\0') {
+        return ESP_ERR_INVALID_ARG;
+    }
+    nvs_handle_t nvs;
+    esp_err_t res = nvs_open("lastfm", NVS_READWRITE, &nvs);
+    if (res != ESP_OK) return res;
+    res = nvs_set_str(nvs, "api_key", api_key);
+    if (res == ESP_OK) res = nvs_set_str(nvs, "api_secret", api_secret);
+    if (res == ESP_OK) res = nvs_commit(nvs);
+    nvs_close(nvs);
+    if (res == ESP_OK) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        snprintf(s_api_key, sizeof(s_api_key), "%s", api_key);
+        snprintf(s_api_secret, sizeof(s_api_secret), "%s", api_secret);
+        s_last_error[0] = '\0';
+        xSemaphoreGive(s_mutex);
+        s_dirty = true;
+    }
+    return res;
+}
+
+void lastfm_scrobbler_get_config(lastfm_config_t *out) {
+    if (out == NULL) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    memset(out, 0, sizeof(*out));
+    snprintf(out->api_key, sizeof(out->api_key), "%s", s_api_key);
+    snprintf(out->api_secret, sizeof(out->api_secret), "%s", s_api_secret);
+    snprintf(out->username, sizeof(out->username), "%s", s_username);
+    xSemaphoreGive(s_mutex);
 }
 
 esp_err_t lastfm_scrobbler_login(const char *username, const char *password) {
@@ -346,6 +405,10 @@ esp_err_t lastfm_scrobbler_login(const char *username, const char *password) {
     snprintf(req->method, sizeof(req->method), "auth.getMobileSession");
     snprintf(req->username, sizeof(req->username), "%s", username);
     snprintf(req->password, sizeof(req->password), "%s", password);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    snprintf(req->api_key, sizeof(req->api_key), "%s", s_api_key);
+    snprintf(req->api_secret, sizeof(req->api_secret), "%s", s_api_secret);
+    xSemaphoreGive(s_mutex);
     if (xTaskCreate(request_task, "lastfm_auth", 12288, req, 3, NULL) != pdPASS) {
         free(req);
         return ESP_FAIL;
@@ -397,6 +460,8 @@ void lastfm_scrobbler_get_status(lastfm_status_t *out) {
     out->configured = api_configured();
     out->has_session = s_session_key[0] != '\0';
     out->enabled = out->configured && out->has_session;
+    out->has_api_key = s_api_key[0] != '\0';
+    out->has_api_secret = s_api_secret[0] != '\0';
     snprintf(out->username, sizeof(out->username), "%s", s_username);
     snprintf(out->last_error, sizeof(out->last_error), "%s", s_last_error);
     xSemaphoreGive(s_mutex);

@@ -28,10 +28,10 @@ For multi-disc releases the disc marker is inserted after the album name:
 ```
 
 Last.fm needs an API key and shared secret from
-https://www.last.fm/api/account/create. Configure these in menuconfig under
-`Disc-O-Matsu`. Optionally set the bootstrap username/password there once;
-Disc-O-Matsu will request a Last.fm session and then remember only the session
-key in NVS.
+https://www.last.fm/api/account/create. Open the in-app menu with `Esc`, choose
+`Last.fm settings`, fill in the API key, shared secret, username and password,
+then choose `Login + save`. Disc-O-Matsu stores the API credentials and Last.fm
+session key in NVS; the password is only used for that login request.
 
 The WiFi file browser is an active mode: press `F4`, wait for the URL shown on
 screen, then open it from another device on the same network. It serves files

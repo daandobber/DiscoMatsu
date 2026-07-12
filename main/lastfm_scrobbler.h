@@ -14,8 +14,16 @@ typedef struct {
     bool has_session;
     bool enabled;
     char username[64];
+    bool has_api_key;
+    bool has_api_secret;
     char last_error[96];
 } lastfm_status_t;
+
+typedef struct {
+    char api_key[80];
+    char api_secret[80];
+    char username[64];
+} lastfm_config_t;
 
 typedef struct {
     const char *artist;
@@ -26,6 +34,9 @@ typedef struct {
 } lastfm_track_info_t;
 
 esp_err_t lastfm_scrobbler_init(void);
+
+esp_err_t lastfm_scrobbler_set_api_credentials(const char *api_key, const char *api_secret);
+void lastfm_scrobbler_get_config(lastfm_config_t *out);
 
 // Optional first-run account bootstrap. On success only the Last.fm session
 // key is retained; the password is not stored.

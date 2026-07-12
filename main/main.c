@@ -43,9 +43,23 @@ static float g_line_h = 20.0f;
 
 static int track_selected = 0;
 static int track_scroll = 0;
-static bool show_exit_menu = false;
 static int lastfm_track_index = -1;
 static bool lastfm_was_playing = false;
+
+typedef enum {
+    OVERLAY_NONE = 0,
+    OVERLAY_MAIN_MENU,
+    OVERLAY_LASTFM_SETTINGS,
+} overlay_t;
+
+static overlay_t overlay = OVERLAY_NONE;
+static int menu_selected = 0;
+static int lastfm_selected = 0;
+static bool lastfm_editing = false;
+static char edit_api_key[80] = "";
+static char edit_api_secret[80] = "";
+static char edit_username[64] = "";
+static char edit_password[96] = "";
 
 static void blit(void) {
     esp_err_t res = bsp_display_blit(0, 0, display_h_res, display_v_res, pax_buf_get_pixels(&fb));
@@ -73,6 +87,49 @@ static void draw_box(float x, float y, float w, float h, pax_col_t color, const 
 
 static void format_mmss(uint32_t total_seconds, char *out, size_t out_len) {
     snprintf(out, out_len, "%02u:%02u", (unsigned)(total_seconds / 60), (unsigned)(total_seconds % 60));
+}
+
+static char *lastfm_field_buffer(int field, size_t *out_len) {
+    switch (field) {
+        case 0:
+            *out_len = sizeof(edit_api_key);
+            return edit_api_key;
+        case 1:
+            *out_len = sizeof(edit_api_secret);
+            return edit_api_secret;
+        case 2:
+            *out_len = sizeof(edit_username);
+            return edit_username;
+        case 3:
+            *out_len = sizeof(edit_password);
+            return edit_password;
+        default:
+            *out_len = 0;
+            return NULL;
+    }
+}
+
+static void load_lastfm_settings_for_edit(void) {
+    lastfm_config_t config;
+    lastfm_scrobbler_get_config(&config);
+    snprintf(edit_api_key, sizeof(edit_api_key), "%s", config.api_key);
+    snprintf(edit_api_secret, sizeof(edit_api_secret), "%s", config.api_secret);
+    snprintf(edit_username, sizeof(edit_username), "%s", config.username);
+    edit_password[0] = '\0';
+    lastfm_selected = 0;
+    lastfm_editing = false;
+}
+
+static void mask_value(const char *src, char *out, size_t out_len) {
+    if (out_len == 0) return;
+    size_t len = strlen(src);
+    if (len == 0) {
+        snprintf(out, out_len, "<empty>");
+        return;
+    }
+    size_t shown = len < out_len - 1 ? len : out_len - 1;
+    memset(out, '*', shown);
+    out[shown] = '\0';
 }
 
 static void build_lastfm_track_info(
@@ -281,17 +338,68 @@ static void render(void) {
     }
     pax_draw_text(&fb, TERM_DIM, pax_font_sky_mono, FONT_SIZE, 16, h - g_line_h, footer);
 
-    if (show_exit_menu) {
-        float menu_w = 220;
-        float menu_h = g_line_h * 3;
+    if (overlay == OVERLAY_MAIN_MENU) {
+        float menu_w = 260;
+        float menu_h = g_line_h * 4;
         float menu_x = (w - menu_w) / 2;
         float menu_y = (h - menu_h) / 2;
         pax_simple_rect(&fb, BLACK, menu_x, menu_y, menu_w, menu_h);
         draw_box(menu_x, menu_y, menu_w, menu_h, TERM_GREEN, "Menu");
-        pax_simple_rect(&fb, TERM_SELECT_BG, menu_x + 8, menu_y + g_line_h + 4, menu_w - 16, g_line_h);
-        pax_draw_text(&fb, TERM_GREEN, pax_font_sky_mono, FONT_SIZE, menu_x + 16, menu_y + g_line_h + 6, "Exit");
+        const char *items[] = {"Last.fm settings", "Exit"};
+        for (int i = 0; i < 2; i++) {
+            float y = menu_y + g_line_h * (i + 1) + 4;
+            if (menu_selected == i) pax_simple_rect(&fb, TERM_SELECT_BG, menu_x + 8, y - 2, menu_w - 16, g_line_h);
+            pax_draw_text(&fb, menu_selected == i ? TERM_GREEN : TERM_FG, pax_font_sky_mono, FONT_SIZE, menu_x + 16, y, items[i]);
+        }
         pax_draw_text(
-            &fb, TERM_DIM, pax_font_sky_mono, FONT_SIZE, menu_x + 16, menu_y + g_line_h * 2 + 8, "Enter=Exit Esc=Back"
+            &fb, TERM_DIM, pax_font_sky_mono, FONT_SIZE, menu_x + 16, menu_y + g_line_h * 3 + 8, "Enter=Select Esc=Back"
+        );
+    } else if (overlay == OVERLAY_LASTFM_SETTINGS) {
+        float menu_w = w - 64;
+        if (menu_w > 620) menu_w = 620;
+        float menu_h = g_line_h * 10;
+        float menu_x = (w - menu_w) / 2;
+        float menu_y = (h - menu_h) / 2;
+        pax_simple_rect(&fb, BLACK, menu_x, menu_y, menu_w, menu_h);
+        draw_box(menu_x, menu_y, menu_w, menu_h, TERM_GREEN, "Last.fm");
+
+        lastfm_status_t status;
+        lastfm_scrobbler_get_status(&status);
+        char status_line[160];
+        snprintf(
+            status_line, sizeof(status_line), "%s%s%s", status.enabled ? "Ready" : "Not linked",
+            status.username[0] != '\0' ? " - " : "", status.username
+        );
+        pax_draw_text(&fb, status.enabled ? TERM_GREEN : TERM_DIM, pax_font_sky_mono, FONT_SIZE, menu_x + 16, menu_y + g_line_h, status_line);
+        if (status.last_error[0] != '\0') {
+            pax_draw_text(&fb, TERM_RED, pax_font_sky_mono, FONT_SIZE, menu_x + 16, menu_y + g_line_h * 2, status.last_error);
+        }
+
+        const char *labels[] = {"API key", "Secret", "Username", "Password", "Login + save", "Back"};
+        for (int i = 0; i < 6; i++) {
+            float y = menu_y + g_line_h * (i + 3);
+            if (lastfm_selected == i) pax_simple_rect(&fb, TERM_SELECT_BG, menu_x + 8, y - 2, menu_w - 16, g_line_h);
+
+            char value[128] = "";
+            if (i < 4) {
+                size_t cap;
+                char *buf = lastfm_field_buffer(i, &cap);
+                (void)cap;
+                if (i == 1 || i == 3) {
+                    mask_value(buf, value, sizeof(value));
+                } else {
+                    snprintf(value, sizeof(value), "%s", buf[0] != '\0' ? buf : "<empty>");
+                }
+                char line[180];
+                snprintf(line, sizeof(line), "%s: %.110s%s", labels[i], value, lastfm_editing && lastfm_selected == i ? "_" : "");
+                pax_draw_text(&fb, lastfm_selected == i ? TERM_GREEN : TERM_FG, pax_font_sky_mono, FONT_SIZE, menu_x + 16, y, line);
+            } else {
+                pax_draw_text(&fb, lastfm_selected == i ? TERM_GREEN : TERM_FG, pax_font_sky_mono, FONT_SIZE, menu_x + 16, y, labels[i]);
+            }
+        }
+        pax_draw_text(
+            &fb, TERM_DIM, pax_font_sky_mono, FONT_SIZE, menu_x + 16, menu_y + g_line_h * 9,
+            lastfm_editing ? "Type text  Enter=Done  Esc=Cancel" : "Enter=Edit/Select  Esc=Back"
         );
     }
 
@@ -299,13 +407,88 @@ static void render(void) {
 }
 
 static bool handle_input(bsp_input_event_t *event) {
+    if (overlay == OVERLAY_LASTFM_SETTINGS && lastfm_editing && event->type == INPUT_EVENT_TYPE_KEYBOARD) {
+        char c = event->args_keyboard.ascii;
+        size_t cap;
+        char *buf = lastfm_field_buffer(lastfm_selected, &cap);
+        if (buf == NULL) return false;
+        size_t len = strlen(buf);
+        if (c == '\b') {
+            if (len > 0) buf[len - 1] = '\0';
+            return true;
+        }
+        if (c >= 32 && c <= 126 && len + 1 < cap) {
+            buf[len] = c;
+            buf[len + 1] = '\0';
+            return true;
+        }
+        return false;
+    }
+
     if (event->type != INPUT_EVENT_TYPE_NAVIGATION || !event->args_navigation.state) return false;
 
-    if (show_exit_menu) {
+    if (overlay == OVERLAY_MAIN_MENU) {
         switch (event->args_navigation.key) {
-            case BSP_INPUT_NAVIGATION_KEY_RETURN: bsp_device_restart_to_launcher(); return true;
-            case BSP_INPUT_NAVIGATION_KEY_ESC: show_exit_menu = false; return true;
+            case BSP_INPUT_NAVIGATION_KEY_UP:
+                if (menu_selected > 0) menu_selected--;
+                return true;
+            case BSP_INPUT_NAVIGATION_KEY_DOWN:
+                if (menu_selected < 1) menu_selected++;
+                return true;
+            case BSP_INPUT_NAVIGATION_KEY_RETURN:
+                if (menu_selected == 0) {
+                    load_lastfm_settings_for_edit();
+                    overlay = OVERLAY_LASTFM_SETTINGS;
+                } else {
+                    bsp_device_restart_to_launcher();
+                }
+                return true;
+            case BSP_INPUT_NAVIGATION_KEY_ESC: overlay = OVERLAY_NONE; return true;
             default: return false;
+        }
+    }
+
+    if (overlay == OVERLAY_LASTFM_SETTINGS) {
+        switch (event->args_navigation.key) {
+            case BSP_INPUT_NAVIGATION_KEY_ESC:
+                if (lastfm_editing) {
+                    lastfm_editing = false;
+                } else {
+                    overlay = OVERLAY_MAIN_MENU;
+                }
+                return true;
+            case BSP_INPUT_NAVIGATION_KEY_UP:
+                if (!lastfm_editing && lastfm_selected > 0) lastfm_selected--;
+                return true;
+            case BSP_INPUT_NAVIGATION_KEY_DOWN:
+            case BSP_INPUT_NAVIGATION_KEY_TAB:
+                if (!lastfm_editing && lastfm_selected < 5) lastfm_selected++;
+                return true;
+            case BSP_INPUT_NAVIGATION_KEY_BACKSPACE:
+                if (lastfm_editing) {
+                    size_t cap;
+                    char *buf = lastfm_field_buffer(lastfm_selected, &cap);
+                    (void)cap;
+                    if (buf != NULL) {
+                        size_t len = strlen(buf);
+                        if (len > 0) buf[len - 1] = '\0';
+                    }
+                }
+                return true;
+            case BSP_INPUT_NAVIGATION_KEY_RETURN:
+                if (lastfm_selected < 4) {
+                    lastfm_editing = !lastfm_editing;
+                } else if (lastfm_selected == 4) {
+                    esp_err_t res = lastfm_scrobbler_set_api_credentials(edit_api_key, edit_api_secret);
+                    if (res == ESP_OK) res = lastfm_scrobbler_login(edit_username, edit_password);
+                    if (res != ESP_OK) ESP_LOGW(TAG, "Last.fm settings failed: %s", esp_err_to_name(res));
+                    edit_password[0] = '\0';
+                } else {
+                    overlay = OVERLAY_MAIN_MENU;
+                }
+                return true;
+            default:
+                return false;
         }
     }
 
@@ -373,7 +556,8 @@ static bool handle_input(bsp_input_event_t *event) {
             return true;
         }
         case BSP_INPUT_NAVIGATION_KEY_ESC:
-            show_exit_menu = true;
+            overlay = OVERLAY_MAIN_MENU;
+            menu_selected = 0;
             return true;
         default:
             return false;
