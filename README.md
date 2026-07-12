@@ -13,10 +13,3 @@ Fresh clone, nothing set up yet:
 .\setup.ps1 -SetupSdk -SetupBadgeLink
 .\install-badgelink.ps1
 ```
-
-That pulls in ESP-IDF and BadgeLink tooling next to the source, builds the
-firmware, and installs it on a Tanmatsu that's in BadgeLink mode. Already
-have ESP-IDF/BadgeLink set up? Skip the flags you don't need, or just run
-`.\install-badgelink.ps1` directly.
-
-MIT licensed, see [LICENSE](LICENSE).
