@@ -37,6 +37,10 @@ The WiFi file browser is an active mode: press `F4`, wait for the URL shown on
 screen, then open it from another device on the same network. It serves files
 under `/sd/Music` for download and can be stopped with `F4` again.
 
+If Disc ID lookup does not find the inserted CD, open `Esc` -> `Metadata
+search`, type an artist/album query, choose a MusicBrainz release, and the app
+will apply that release's album and track metadata to the current disc.
+
 ## Install
 
 Fresh clone, nothing set up yet:

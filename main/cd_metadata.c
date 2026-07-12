@@ -27,6 +27,7 @@ static const char *TAG = "cd_metadata";
 
 static SemaphoreHandle_t s_mutex          = NULL;
 static cd_metadata_status_t s_status      = {0};
+static cd_metadata_search_status_t s_search = {0};
 static volatile bool s_dirty              = false;
 static uint16_t *s_cover_art               = NULL;
 
@@ -35,11 +36,57 @@ typedef struct {
     int track_count;
 } lookup_request_t;
 
+typedef struct {
+    char query[96];
+    int current_track_count;
+} search_request_t;
+
+typedef struct {
+    char release_id[64];
+    int current_track_count;
+} apply_request_t;
+
+static esp_err_t http_get(const char *url, uint8_t *out_buf, size_t cap, size_t *out_len, int *out_status);
+static void decode_and_store_cover_art(const uint8_t *jpeg_data, size_t jpeg_len);
+
 static void set_state(cd_metadata_state_t state) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_status.state = state;
     xSemaphoreGive(s_mutex);
     s_dirty = true;
+}
+
+static void set_search_state(cd_metadata_search_state_t state, const char *error) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_search.state = state;
+    if (error != NULL) {
+        snprintf(s_search.last_error, sizeof(s_search.last_error), "%s", error);
+    } else if (state != CD_METADATA_SEARCH_ERROR) {
+        s_search.last_error[0] = '\0';
+    }
+    xSemaphoreGive(s_mutex);
+    s_dirty = true;
+}
+
+static int append_urlenc(char *out, size_t cap, size_t pos, const char *s) {
+    static const char hex[] = "0123456789ABCDEF";
+    for (size_t i = 0; s != NULL && s[i] != '\0'; i++) {
+        unsigned char c = (unsigned char)s[i];
+        bool safe = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-' ||
+                    c == '_' || c == '.' || c == '~';
+        if (safe) {
+            if (pos + 1 >= cap) return -1;
+            out[pos++] = (char)c;
+        } else {
+            if (pos + 3 >= cap) return -1;
+            out[pos++] = '%';
+            out[pos++] = hex[c >> 4];
+            out[pos++] = hex[c & 0x0F];
+        }
+    }
+    if (pos >= cap) return -1;
+    out[pos] = '\0';
+    return (int)pos;
 }
 
 // Builds the MusicBrainz Disc ID: SHA-1 of a fixed-format TOC string
@@ -138,6 +185,129 @@ static cJSON *find_best_release(cJSON *releases, int track_count, cJSON **out_me
     cJSON *release = cJSON_GetArrayItem(releases, 0);
     *out_medium = release ? find_best_medium(release, track_count) : NULL;
     return release;
+}
+
+static void artist_credit_to_string(cJSON *artist_credit, char *out, size_t out_len) {
+    out[0] = '\0';
+    if (!cJSON_IsArray(artist_credit)) return;
+
+    size_t pos = 0;
+    int count = cJSON_GetArraySize(artist_credit);
+    for (int i = 0; i < count; i++) {
+        cJSON *credit = cJSON_GetArrayItem(artist_credit, i);
+        cJSON *name = cJSON_GetObjectItem(credit, "name");
+        cJSON *joinphrase = cJSON_GetObjectItem(credit, "joinphrase");
+        if (cJSON_IsString(name)) {
+            int written = snprintf(out + pos, out_len - pos, "%s", name->valuestring);
+            if (written < 0 || pos + (size_t)written >= out_len) break;
+            pos += (size_t)written;
+        }
+        if (cJSON_IsString(joinphrase)) {
+            int written = snprintf(out + pos, out_len - pos, "%s", joinphrase->valuestring);
+            if (written < 0 || pos + (size_t)written >= out_len) break;
+            pos += (size_t)written;
+        }
+    }
+}
+
+static int medium_track_count(cJSON *release) {
+    cJSON *release_track_count = cJSON_GetObjectItem(release, "track-count");
+    if (cJSON_IsNumber(release_track_count)) return release_track_count->valueint;
+
+    cJSON *media = cJSON_GetObjectItem(release, "media");
+    if (cJSON_IsArray(media) && cJSON_GetArraySize(media) > 0) {
+        cJSON *first_medium = cJSON_GetArrayItem(media, 0);
+        cJSON *medium_track_count = cJSON_GetObjectItem(first_medium, "track-count");
+        if (cJSON_IsNumber(medium_track_count)) return medium_track_count->valueint;
+    }
+
+    cJSON *medium = find_best_medium(release, 0);
+    cJSON *tracks = medium ? cJSON_GetObjectItem(medium, "tracks") : NULL;
+    return cJSON_IsArray(tracks) ? cJSON_GetArraySize(tracks) : 0;
+}
+
+static void apply_release(cJSON *release, int current_track_count, char *out_release_mbid, size_t out_release_mbid_len) {
+    cJSON *selected_medium = NULL;
+    if (current_track_count > 0) {
+        cJSON *media = cJSON_GetObjectItem(release, "media");
+        if (cJSON_IsArray(media)) {
+            int media_count = cJSON_GetArraySize(media);
+            for (int i = 0; i < media_count; i++) {
+                cJSON *medium = cJSON_GetArrayItem(media, i);
+                cJSON *tracks = cJSON_GetObjectItem(medium, "tracks");
+                if (cJSON_IsArray(tracks) && cJSON_GetArraySize(tracks) == current_track_count) {
+                    selected_medium = medium;
+                    break;
+                }
+            }
+        }
+    }
+    if (selected_medium == NULL) selected_medium = find_best_medium(release, current_track_count);
+
+    cJSON *title          = cJSON_GetObjectItem(release, "title");
+    cJSON *artist_credit  = cJSON_GetObjectItem(release, "artist-credit");
+    cJSON *release_id     = cJSON_GetObjectItem(release, "id");
+    cJSON *date           = cJSON_GetObjectItem(release, "date");
+    cJSON *media          = cJSON_GetObjectItem(release, "media");
+
+    out_release_mbid[0] = '\0';
+    if (cJSON_IsString(release_id)) snprintf(out_release_mbid, out_release_mbid_len, "%s", release_id->valuestring);
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    memset(s_status.album, 0, sizeof(s_status.album));
+    memset(s_status.artist, 0, sizeof(s_status.artist));
+    memset(s_status.year, 0, sizeof(s_status.year));
+    memset(s_status.track_titles, 0, sizeof(s_status.track_titles));
+    s_status.track_title_count = 0;
+    s_status.disc_number = 0;
+    s_status.disc_count = 0;
+
+    if (cJSON_IsString(title)) snprintf(s_status.album, sizeof(s_status.album), "%s", title->valuestring);
+    if (cJSON_IsString(date) && strlen(date->valuestring) >= 4) {
+        snprintf(s_status.year, sizeof(s_status.year), "%.4s", date->valuestring);
+    }
+    artist_credit_to_string(artist_credit, s_status.artist, sizeof(s_status.artist));
+
+    if (selected_medium != NULL && cJSON_IsArray(media)) {
+        s_status.disc_count = cJSON_GetArraySize(media);
+        cJSON *position = cJSON_GetObjectItem(selected_medium, "position");
+        if (cJSON_IsNumber(position)) s_status.disc_number = position->valueint;
+        cJSON *track_list = cJSON_GetObjectItem(selected_medium, "tracks");
+        if (cJSON_IsArray(track_list)) {
+            int n = cJSON_GetArraySize(track_list);
+            if (n > CDROM_AUDIO_MAX_TRACKS) n = CDROM_AUDIO_MAX_TRACKS;
+            for (int i = 0; i < n; i++) {
+                cJSON *t = cJSON_GetArrayItem(track_list, i);
+                cJSON *t_title = cJSON_GetObjectItem(t, "title");
+                if (cJSON_IsString(t_title)) {
+                    snprintf(s_status.track_titles[i], sizeof(s_status.track_titles[i]), "%s", t_title->valuestring);
+                }
+            }
+            s_status.track_title_count = n;
+        }
+    }
+    s_status.state = CD_METADATA_STATE_FOUND;
+    xSemaphoreGive(s_mutex);
+    s_dirty = true;
+}
+
+static void fetch_cover_art(const char *release_mbid) {
+    if (release_mbid == NULL || release_mbid[0] == '\0') return;
+
+    char art_url[160];
+    snprintf(art_url, sizeof(art_url), "https://coverartarchive.org/release/%s/front-250", release_mbid);
+
+    uint8_t *jbuf = heap_caps_malloc(JPEG_BUF_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (jbuf == NULL) return;
+    size_t jlen = 0;
+    int jstatus = 0;
+    esp_err_t jerr = http_get(art_url, jbuf, JPEG_BUF_CAP, &jlen, &jstatus);
+    if (jerr == ESP_OK && jstatus == 200 && jlen > 0) {
+        decode_and_store_cover_art(jbuf, jlen);
+    } else {
+        ESP_LOGI(TAG, "No cover art available (status=%d)", jstatus);
+    }
+    heap_caps_free(jbuf);
 }
 
 typedef struct {
@@ -403,80 +573,150 @@ static void lookup_task(void *arg) {
         goto done;
     }
 
-    cJSON *selected_medium = NULL;
-    cJSON *release        = find_best_release(releases, req->track_count, &selected_medium);
-    cJSON *title          = cJSON_GetObjectItem(release, "title");
-    cJSON *artist_credit  = cJSON_GetObjectItem(release, "artist-credit");
-    cJSON *release_id     = cJSON_GetObjectItem(release, "id");
-    cJSON *date           = cJSON_GetObjectItem(release, "date");
-    cJSON *media          = cJSON_GetObjectItem(release, "media");
-
     char release_mbid[64] = {0};
-    if (cJSON_IsString(release_id)) snprintf(release_mbid, sizeof(release_mbid), "%s", release_id->valuestring);
-
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    memset(s_status.album, 0, sizeof(s_status.album));
-    memset(s_status.artist, 0, sizeof(s_status.artist));
-    memset(s_status.year, 0, sizeof(s_status.year));
-    memset(s_status.track_titles, 0, sizeof(s_status.track_titles));
-    s_status.track_title_count = 0;
-    s_status.disc_number = 0;
-    s_status.disc_count = 0;
-
-    if (cJSON_IsString(title)) snprintf(s_status.album, sizeof(s_status.album), "%s", title->valuestring);
-    if (cJSON_IsString(date) && strlen(date->valuestring) >= 4) {
-        snprintf(s_status.year, sizeof(s_status.year), "%.4s", date->valuestring);
-    }
-    if (cJSON_IsArray(artist_credit) && cJSON_GetArraySize(artist_credit) > 0) {
-        cJSON *first_artist = cJSON_GetArrayItem(artist_credit, 0);
-        cJSON *name         = cJSON_GetObjectItem(first_artist, "name");
-        if (cJSON_IsString(name)) snprintf(s_status.artist, sizeof(s_status.artist), "%s", name->valuestring);
-    }
-    if (cJSON_IsArray(media) && cJSON_GetArraySize(media) > 0) {
-        s_status.disc_count = cJSON_GetArraySize(media);
-        cJSON *position      = cJSON_GetObjectItem(selected_medium, "position");
-        if (cJSON_IsNumber(position)) s_status.disc_number = position->valueint;
-        cJSON *track_list    = cJSON_GetObjectItem(selected_medium, "tracks");
-        if (cJSON_IsArray(track_list)) {
-            int n = cJSON_GetArraySize(track_list);
-            if (n > CDROM_AUDIO_MAX_TRACKS) n = CDROM_AUDIO_MAX_TRACKS;
-            for (int i = 0; i < n; i++) {
-                cJSON *t       = cJSON_GetArrayItem(track_list, i);
-                cJSON *t_title = cJSON_GetObjectItem(t, "title");
-                if (cJSON_IsString(t_title)) {
-                    snprintf(s_status.track_titles[i], sizeof(s_status.track_titles[i]), "%s", t_title->valuestring);
-                }
-            }
-            s_status.track_title_count = n;
-        }
-    }
-    s_status.state = CD_METADATA_STATE_FOUND;
-    xSemaphoreGive(s_mutex);
-    s_dirty = true;
+    cJSON *selected_medium = NULL;
+    cJSON *release = find_best_release(releases, req->track_count, &selected_medium);
+    (void)selected_medium;
+    apply_release(release, req->track_count, release_mbid, sizeof(release_mbid));
 
     cJSON_Delete(root);
     ESP_LOGI(TAG, "Found: %s - %s", s_status.artist, s_status.album);
 
-    if (release_mbid[0] != '\0') {
-        char art_url[160];
-        snprintf(art_url, sizeof(art_url), "https://coverartarchive.org/release/%s/front-250", release_mbid);
-
-        uint8_t *jbuf = heap_caps_malloc(JPEG_BUF_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
-        if (jbuf != NULL) {
-            size_t jlen  = 0;
-            int jstatus  = 0;
-            esp_err_t jerr = http_get(art_url, jbuf, JPEG_BUF_CAP, &jlen, &jstatus);
-            if (jerr == ESP_OK && jstatus == 200 && jlen > 0) {
-                decode_and_store_cover_art(jbuf, jlen);
-            } else {
-                ESP_LOGI(TAG, "No cover art available (status=%d)", jstatus);
-            }
-            heap_caps_free(jbuf);
-        }
-    }
+    fetch_cover_art(release_mbid);
 
 done:
     wifi_setup_disconnect();
+    if (buf != NULL) heap_caps_free(buf);
+    free(req);
+    vTaskDelete(NULL);
+}
+
+static void search_task(void *arg) {
+    search_request_t *req = (search_request_t *)arg;
+    uint8_t *buf = NULL;
+    set_search_state(CD_METADATA_SEARCH_SEARCHING, NULL);
+
+    if (!wifi_setup_connect_blocking(15000)) {
+        set_search_state(CD_METADATA_SEARCH_ERROR, "no wifi");
+        goto done;
+    }
+
+    char url[512];
+    int pos = snprintf(url, sizeof(url), "https://musicbrainz.org/ws/2/release?fmt=json&limit=%d&query=", CD_METADATA_SEARCH_MAX_RESULTS);
+    if (pos < 0 || pos >= (int)sizeof(url)) {
+        set_search_state(CD_METADATA_SEARCH_ERROR, "query too long");
+        goto done_wifi;
+    }
+    if (append_urlenc(url, sizeof(url), (size_t)pos, req->query) < 0) {
+        set_search_state(CD_METADATA_SEARCH_ERROR, "query too long");
+        goto done_wifi;
+    }
+
+    buf = heap_caps_malloc(HTTP_BUF_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == NULL) {
+        set_search_state(CD_METADATA_SEARCH_ERROR, "no memory");
+        goto done_wifi;
+    }
+
+    size_t len = 0;
+    int status = 0;
+    esp_err_t err = http_get(url, buf, HTTP_BUF_CAP, &len, &status);
+    if (err != ESP_OK || status != 200) {
+        ESP_LOGW(TAG, "MusicBrainz search failed: %s status=%d", esp_err_to_name(err), status);
+        set_search_state(CD_METADATA_SEARCH_ERROR, "search failed");
+        goto done_wifi;
+    }
+
+    cJSON *root = cJSON_ParseWithLength((const char *)buf, len);
+    cJSON *releases = root ? cJSON_GetObjectItem(root, "releases") : NULL;
+    if (!cJSON_IsArray(releases)) {
+        if (root) cJSON_Delete(root);
+        set_search_state(CD_METADATA_SEARCH_ERROR, "bad response");
+        goto done_wifi;
+    }
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    memset(s_search.results, 0, sizeof(s_search.results));
+    s_search.result_count = 0;
+    snprintf(s_search.query, sizeof(s_search.query), "%s", req->query);
+    int count = cJSON_GetArraySize(releases);
+    if (count > CD_METADATA_SEARCH_MAX_RESULTS) count = CD_METADATA_SEARCH_MAX_RESULTS;
+    for (int i = 0; i < count; i++) {
+        cJSON *release = cJSON_GetArrayItem(releases, i);
+        cJSON *id = cJSON_GetObjectItem(release, "id");
+        cJSON *title = cJSON_GetObjectItem(release, "title");
+        cJSON *date = cJSON_GetObjectItem(release, "date");
+        cJSON *artist_credit = cJSON_GetObjectItem(release, "artist-credit");
+        cd_metadata_search_result_t *result = &s_search.results[s_search.result_count];
+        if (!cJSON_IsString(id) || !cJSON_IsString(title)) continue;
+        snprintf(result->id, sizeof(result->id), "%s", id->valuestring);
+        snprintf(result->album, sizeof(result->album), "%s", title->valuestring);
+        if (cJSON_IsString(date) && strlen(date->valuestring) >= 4) snprintf(result->year, sizeof(result->year), "%.4s", date->valuestring);
+        artist_credit_to_string(artist_credit, result->artist, sizeof(result->artist));
+        result->track_count = medium_track_count(release);
+        s_search.result_count++;
+    }
+    s_search.state = s_search.result_count > 0 ? CD_METADATA_SEARCH_RESULTS : CD_METADATA_SEARCH_ERROR;
+    if (s_search.result_count == 0) snprintf(s_search.last_error, sizeof(s_search.last_error), "no results");
+    else s_search.last_error[0] = '\0';
+    xSemaphoreGive(s_mutex);
+    s_dirty = true;
+
+    cJSON_Delete(root);
+
+done_wifi:
+    wifi_setup_disconnect();
+done:
+    if (buf != NULL) heap_caps_free(buf);
+    free(req);
+    vTaskDelete(NULL);
+}
+
+static void apply_task(void *arg) {
+    apply_request_t *req = (apply_request_t *)arg;
+    uint8_t *buf = NULL;
+    set_search_state(CD_METADATA_SEARCH_APPLYING, NULL);
+
+    if (!wifi_setup_connect_blocking(15000)) {
+        set_search_state(CD_METADATA_SEARCH_ERROR, "no wifi");
+        goto done;
+    }
+
+    char url[256];
+    snprintf(
+        url, sizeof(url), "https://musicbrainz.org/ws/2/release/%s?fmt=json&inc=recordings+artist-credits",
+        req->release_id
+    );
+
+    buf = heap_caps_malloc(HTTP_BUF_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (buf == NULL) {
+        set_search_state(CD_METADATA_SEARCH_ERROR, "no memory");
+        goto done_wifi;
+    }
+
+    size_t len = 0;
+    int status = 0;
+    esp_err_t err = http_get(url, buf, HTTP_BUF_CAP, &len, &status);
+    if (err != ESP_OK || status != 200) {
+        set_search_state(CD_METADATA_SEARCH_ERROR, "release failed");
+        goto done_wifi;
+    }
+
+    cJSON *release = cJSON_ParseWithLength((const char *)buf, len);
+    if (release == NULL) {
+        set_search_state(CD_METADATA_SEARCH_ERROR, "bad release");
+        goto done_wifi;
+    }
+
+    char release_mbid[64] = {0};
+    apply_release(release, req->current_track_count, release_mbid, sizeof(release_mbid));
+    cJSON_Delete(release);
+    set_search_state(CD_METADATA_SEARCH_IDLE, NULL);
+    fetch_cover_art(release_mbid);
+
+done_wifi:
+    wifi_setup_disconnect();
+done:
     if (buf != NULL) heap_caps_free(buf);
     free(req);
     vTaskDelete(NULL);
@@ -501,10 +741,40 @@ void cd_metadata_request_lookup(const cdrom_track_t *tracks, int track_count) {
     }
 }
 
+void cd_metadata_request_search(const char *query, int current_track_count) {
+    if (query == NULL || query[0] == '\0') return;
+    search_request_t *req = calloc(1, sizeof(search_request_t));
+    if (req == NULL) return;
+    snprintf(req->query, sizeof(req->query), "%s", query);
+    req->current_track_count = current_track_count;
+    if (xTaskCreate(search_task, "cd_meta_search", 16384, req, 4, NULL) != pdPASS) {
+        free(req);
+    }
+}
+
+void cd_metadata_apply_search_result(int index, int current_track_count) {
+    apply_request_t *req = calloc(1, sizeof(apply_request_t));
+    if (req == NULL) return;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (index < 0 || index >= s_search.result_count) {
+        xSemaphoreGive(s_mutex);
+        free(req);
+        return;
+    }
+    snprintf(req->release_id, sizeof(req->release_id), "%s", s_search.results[index].id);
+    xSemaphoreGive(s_mutex);
+    req->current_track_count = current_track_count;
+    if (xTaskCreate(apply_task, "cd_meta_apply", 16384, req, 4, NULL) != pdPASS) {
+        free(req);
+    }
+}
+
 void cd_metadata_clear(void) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     memset(&s_status, 0, sizeof(s_status));
+    memset(&s_search, 0, sizeof(s_search));
     s_status.state = CD_METADATA_STATE_IDLE;
+    s_search.state = CD_METADATA_SEARCH_IDLE;
     if (s_cover_art != NULL) {
         heap_caps_free(s_cover_art);
         s_cover_art = NULL;
@@ -516,6 +786,12 @@ void cd_metadata_clear(void) {
 void cd_metadata_get_status(cd_metadata_status_t *out) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     *out = s_status;
+    xSemaphoreGive(s_mutex);
+}
+
+void cd_metadata_get_search_status(cd_metadata_search_status_t *out) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    *out = s_search;
     xSemaphoreGive(s_mutex);
 }
 

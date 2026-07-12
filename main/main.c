@@ -50,6 +50,7 @@ typedef enum {
     OVERLAY_NONE = 0,
     OVERLAY_MAIN_MENU,
     OVERLAY_LASTFM_SETTINGS,
+    OVERLAY_METADATA_SEARCH,
 } overlay_t;
 
 static overlay_t overlay = OVERLAY_NONE;
@@ -60,6 +61,9 @@ static char edit_api_key[80] = "";
 static char edit_api_secret[80] = "";
 static char edit_username[64] = "";
 static char edit_password[96] = "";
+static char metadata_query[96] = "";
+static int metadata_selected = 0;
+static bool metadata_editing = false;
 
 static void blit(void) {
     esp_err_t res = bsp_display_blit(0, 0, display_h_res, display_v_res, pax_buf_get_pixels(&fb));
@@ -130,6 +134,18 @@ static void mask_value(const char *src, char *out, size_t out_len) {
     size_t shown = len < out_len - 1 ? len : out_len - 1;
     memset(out, '*', shown);
     out[shown] = '\0';
+}
+
+static void append_ascii(char *buf, size_t cap, char c) {
+    size_t len = strlen(buf);
+    if (c == '\b') {
+        if (len > 0) buf[len - 1] = '\0';
+        return;
+    }
+    if (c >= 32 && c <= 126 && len + 1 < cap) {
+        buf[len] = c;
+        buf[len + 1] = '\0';
+    }
 }
 
 static void build_lastfm_track_info(
@@ -340,19 +356,19 @@ static void render(void) {
 
     if (overlay == OVERLAY_MAIN_MENU) {
         float menu_w = 260;
-        float menu_h = g_line_h * 4;
+        float menu_h = g_line_h * 5;
         float menu_x = (w - menu_w) / 2;
         float menu_y = (h - menu_h) / 2;
         pax_simple_rect(&fb, BLACK, menu_x, menu_y, menu_w, menu_h);
         draw_box(menu_x, menu_y, menu_w, menu_h, TERM_GREEN, "Menu");
-        const char *items[] = {"Last.fm settings", "Exit"};
-        for (int i = 0; i < 2; i++) {
+        const char *items[] = {"Metadata search", "Last.fm settings", "Exit"};
+        for (int i = 0; i < 3; i++) {
             float y = menu_y + g_line_h * (i + 1) + 4;
             if (menu_selected == i) pax_simple_rect(&fb, TERM_SELECT_BG, menu_x + 8, y - 2, menu_w - 16, g_line_h);
             pax_draw_text(&fb, menu_selected == i ? TERM_GREEN : TERM_FG, pax_font_sky_mono, FONT_SIZE, menu_x + 16, y, items[i]);
         }
         pax_draw_text(
-            &fb, TERM_DIM, pax_font_sky_mono, FONT_SIZE, menu_x + 16, menu_y + g_line_h * 3 + 8, "Enter=Select Esc=Back"
+            &fb, TERM_DIM, pax_font_sky_mono, FONT_SIZE, menu_x + 16, menu_y + g_line_h * 4 + 8, "Enter=Select Esc=Back"
         );
     } else if (overlay == OVERLAY_LASTFM_SETTINGS) {
         float menu_w = w - 64;
@@ -401,31 +417,73 @@ static void render(void) {
             &fb, TERM_DIM, pax_font_sky_mono, FONT_SIZE, menu_x + 16, menu_y + g_line_h * 9,
             lastfm_editing ? "Type text  Enter=Done  Esc=Cancel" : "Enter=Edit/Select  Esc=Back"
         );
+    } else if (overlay == OVERLAY_METADATA_SEARCH) {
+        float menu_w = w - 64;
+        if (menu_w > 700) menu_w = 700;
+        float menu_h = g_line_h * 10;
+        float menu_x = (w - menu_w) / 2;
+        float menu_y = (h - menu_h) / 2;
+        pax_simple_rect(&fb, BLACK, menu_x, menu_y, menu_w, menu_h);
+        draw_box(menu_x, menu_y, menu_w, menu_h, TERM_GREEN, "Metadata");
+
+        cd_metadata_search_status_t search;
+        cd_metadata_get_search_status(&search);
+        char query_line[160];
+        snprintf(query_line, sizeof(query_line), "Search: %.120s%s", metadata_query[0] ? metadata_query : "<type artist album>", metadata_editing ? "_" : "");
+        if (metadata_selected == 0) pax_simple_rect(&fb, TERM_SELECT_BG, menu_x + 8, menu_y + g_line_h - 2, menu_w - 16, g_line_h);
+        pax_draw_text(&fb, metadata_selected == 0 ? TERM_GREEN : TERM_FG, pax_font_sky_mono, FONT_SIZE, menu_x + 16, menu_y + g_line_h, query_line);
+
+        const char *state = "";
+        if (search.state == CD_METADATA_SEARCH_SEARCHING) state = "Searching...";
+        else if (search.state == CD_METADATA_SEARCH_APPLYING) state = "Applying...";
+        else if (search.state == CD_METADATA_SEARCH_ERROR) state = search.last_error;
+        else if (search.state == CD_METADATA_SEARCH_RESULTS) state = "Choose a release";
+        pax_draw_text(&fb, search.state == CD_METADATA_SEARCH_ERROR ? TERM_RED : TERM_DIM, pax_font_sky_mono, FONT_SIZE, menu_x + 16, menu_y + g_line_h * 2, state);
+
+        int rows = search.result_count;
+        if (rows > CD_METADATA_SEARCH_MAX_RESULTS) rows = CD_METADATA_SEARCH_MAX_RESULTS;
+        for (int i = 0; i < rows; i++) {
+            float y = menu_y + g_line_h * (i + 3);
+            int selectable = i + 1;
+            if (metadata_selected == selectable) pax_simple_rect(&fb, TERM_SELECT_BG, menu_x + 8, y - 2, menu_w - 16, g_line_h);
+            char line[200];
+            snprintf(
+                line, sizeof(line), "%.64s - %.64s%s%.4s%s  %d tracks", search.results[i].artist, search.results[i].album,
+                search.results[i].year[0] ? " (" : "", search.results[i].year, search.results[i].year[0] ? ")" : "",
+                search.results[i].track_count
+            );
+            pax_draw_text(&fb, metadata_selected == selectable ? TERM_GREEN : TERM_FG, pax_font_sky_mono, FONT_SIZE, menu_x + 16, y, line);
+        }
+        pax_draw_text(
+            &fb, TERM_DIM, pax_font_sky_mono, FONT_SIZE, menu_x + 16, menu_y + g_line_h * 9,
+            metadata_editing ? "Type query  Enter=Search  Esc=Cancel" : "Enter=Edit/Apply  Esc=Back"
+        );
     }
 
     blit();
 }
 
 static bool handle_input(bsp_input_event_t *event) {
+    if (overlay == OVERLAY_METADATA_SEARCH && metadata_editing && event->type == INPUT_EVENT_TYPE_KEYBOARD) {
+        append_ascii(metadata_query, sizeof(metadata_query), event->args_keyboard.ascii);
+        return true;
+    }
+
     if (overlay == OVERLAY_LASTFM_SETTINGS && lastfm_editing && event->type == INPUT_EVENT_TYPE_KEYBOARD) {
         char c = event->args_keyboard.ascii;
         size_t cap;
         char *buf = lastfm_field_buffer(lastfm_selected, &cap);
         if (buf == NULL) return false;
-        size_t len = strlen(buf);
-        if (c == '\b') {
-            if (len > 0) buf[len - 1] = '\0';
-            return true;
-        }
-        if (c >= 32 && c <= 126 && len + 1 < cap) {
-            buf[len] = c;
-            buf[len + 1] = '\0';
-            return true;
-        }
-        return false;
+        append_ascii(buf, cap, c);
+        return true;
     }
 
     if (event->type != INPUT_EVENT_TYPE_NAVIGATION || !event->args_navigation.state) return false;
+
+    static cdrom_status_t cd_status;
+    cdrom_audio_get_status(&cd_status);
+    cdplayer_state_t play_state;
+    cdplayer_get_state(&play_state);
 
     if (overlay == OVERLAY_MAIN_MENU) {
         switch (event->args_navigation.key) {
@@ -433,10 +491,14 @@ static bool handle_input(bsp_input_event_t *event) {
                 if (menu_selected > 0) menu_selected--;
                 return true;
             case BSP_INPUT_NAVIGATION_KEY_DOWN:
-                if (menu_selected < 1) menu_selected++;
+                if (menu_selected < 2) menu_selected++;
                 return true;
             case BSP_INPUT_NAVIGATION_KEY_RETURN:
                 if (menu_selected == 0) {
+                    overlay = OVERLAY_METADATA_SEARCH;
+                    metadata_selected = 0;
+                    metadata_editing = metadata_query[0] == '\0';
+                } else if (menu_selected == 1) {
                     load_lastfm_settings_for_edit();
                     overlay = OVERLAY_LASTFM_SETTINGS;
                 } else {
@@ -492,10 +554,40 @@ static bool handle_input(bsp_input_event_t *event) {
         }
     }
 
-    static cdrom_status_t cd_status;
-    cdrom_audio_get_status(&cd_status);
-    cdplayer_state_t play_state;
-    cdplayer_get_state(&play_state);
+    if (overlay == OVERLAY_METADATA_SEARCH) {
+        cd_metadata_search_status_t search;
+        cd_metadata_get_search_status(&search);
+        switch (event->args_navigation.key) {
+            case BSP_INPUT_NAVIGATION_KEY_ESC:
+                if (metadata_editing) metadata_editing = false;
+                else overlay = OVERLAY_MAIN_MENU;
+                return true;
+            case BSP_INPUT_NAVIGATION_KEY_UP:
+                if (!metadata_editing && metadata_selected > 0) metadata_selected--;
+                return true;
+            case BSP_INPUT_NAVIGATION_KEY_DOWN:
+            case BSP_INPUT_NAVIGATION_KEY_TAB:
+                if (!metadata_editing && metadata_selected < search.result_count) metadata_selected++;
+                return true;
+            case BSP_INPUT_NAVIGATION_KEY_BACKSPACE:
+                if (metadata_editing) append_ascii(metadata_query, sizeof(metadata_query), '\b');
+                return true;
+            case BSP_INPUT_NAVIGATION_KEY_RETURN:
+                if (metadata_selected == 0) {
+                    if (metadata_editing) {
+                        cd_metadata_request_search(metadata_query, cd_status.track_count);
+                        metadata_editing = false;
+                    } else {
+                        metadata_editing = true;
+                    }
+                } else {
+                    cd_metadata_apply_search_result(metadata_selected - 1, cd_status.track_count);
+                }
+                return true;
+            default:
+                return false;
+        }
+    }
 
     switch (event->args_navigation.key) {
         case BSP_INPUT_NAVIGATION_KEY_VOLUME_UP: {
