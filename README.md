@@ -10,6 +10,7 @@ album, track names, and cover art from MusicBrainz.
 - Play audio CDs from a USB CD/DVD drive.
 - Rip the inserted CD manually with `F3` to WAV files on the SD card under
   `/sd/Music`.
+- Share ripped files manually with `F4` over WiFi from a browser.
 - Scrobble playback to Last.fm automatically when Last.fm is configured.
 
 WAV rips use this layout:
@@ -31,6 +32,10 @@ https://www.last.fm/api/account/create. Configure these in menuconfig under
 `Disc-O-Matsu`. Optionally set the bootstrap username/password there once;
 Disc-O-Matsu will request a Last.fm session and then remember only the session
 key in NVS.
+
+The WiFi file browser is an active mode: press `F4`, wait for the URL shown on
+screen, then open it from another device on the same network. It serves files
+under `/sd/Music` for download and can be stopped with `F4` again.
 
 ## Install
 

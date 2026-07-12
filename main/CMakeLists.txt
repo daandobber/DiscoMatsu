@@ -12,6 +12,7 @@ idf_component_register(
 		"cd_ripper.c"
 		"sd_storage.c"
 		"wifi_setup.c"
+		"wifi_file_server.c"
 		"cd_metadata.c"
 		"lastfm_scrobbler.c"
 		"main.c"
@@ -29,6 +30,8 @@ idf_component_register(
 		tanmatsu-wifi
 		bt
 		esp_http_client
+		esp_http_server
+		esp_netif
 		esp_driver_jpeg
 		esp_jpeg
 		esp-tls

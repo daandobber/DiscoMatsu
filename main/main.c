@@ -19,6 +19,7 @@
 #include "pax_text.h"
 #include "pax_types.h"
 #include "lastfm_scrobbler.h"
+#include "wifi_file_server.h"
 #include "wifi_setup.h"
 
 static const char TAG[] = "discmatsu";
@@ -213,29 +214,55 @@ static void render(void) {
 
     cd_ripper_status_t rip;
     cd_ripper_get_status(&rip);
+    wifi_file_server_status_t files;
+    wifi_file_server_get_status(&files);
     char rip_line[160];
-    switch (rip.state) {
-        case CD_RIPPER_STATE_MOUNTING_SD:
-            snprintf(rip_line, sizeof(rip_line), "Rip: mounting SD card...");
-            break;
-        case CD_RIPPER_STATE_RIPPING:
-            snprintf(
-                rip_line, sizeof(rip_line), "Rip: track %d/%d %lu%%", rip.current_track, rip.total_tracks,
-                (unsigned long)rip.current_percent
-            );
-            break;
-        case CD_RIPPER_STATE_DONE:
-            snprintf(rip_line, sizeof(rip_line), "Rip done: %.140s", rip.current_path);
-            break;
-        case CD_RIPPER_STATE_ERROR:
-            snprintf(rip_line, sizeof(rip_line), "Rip error: %s", rip.last_error);
-            break;
-        case CD_RIPPER_STATE_IDLE:
-        default:
-            snprintf(rip_line, sizeof(rip_line), "F3=Rip WAV to SD");
-            break;
+    pax_col_t rip_color = TERM_DIM;
+    if (files.state != WIFI_FILE_SERVER_STATE_IDLE) {
+        switch (files.state) {
+            case WIFI_FILE_SERVER_STATE_CONNECTING_WIFI:
+                snprintf(rip_line, sizeof(rip_line), "Files: connecting WiFi...");
+                break;
+            case WIFI_FILE_SERVER_STATE_MOUNTING_SD:
+                snprintf(rip_line, sizeof(rip_line), "Files: mounting SD card...");
+                break;
+            case WIFI_FILE_SERVER_STATE_RUNNING:
+                snprintf(rip_line, sizeof(rip_line), "Files: %s  F4=Stop", files.url);
+                rip_color = TERM_GREEN;
+                break;
+            case WIFI_FILE_SERVER_STATE_ERROR:
+                snprintf(rip_line, sizeof(rip_line), "Files error: %s", files.last_error);
+                rip_color = TERM_RED;
+                break;
+            case WIFI_FILE_SERVER_STATE_IDLE:
+            default:
+                break;
+        }
+    } else {
+        switch (rip.state) {
+            case CD_RIPPER_STATE_MOUNTING_SD:
+                snprintf(rip_line, sizeof(rip_line), "Rip: mounting SD card...");
+                break;
+            case CD_RIPPER_STATE_RIPPING:
+                snprintf(
+                    rip_line, sizeof(rip_line), "Rip: track %d/%d %lu%%", rip.current_track, rip.total_tracks,
+                    (unsigned long)rip.current_percent
+                );
+                break;
+            case CD_RIPPER_STATE_DONE:
+                snprintf(rip_line, sizeof(rip_line), "Rip done: %.140s", rip.current_path);
+                break;
+            case CD_RIPPER_STATE_ERROR:
+                snprintf(rip_line, sizeof(rip_line), "Rip error: %s", rip.last_error);
+                rip_color = TERM_RED;
+                break;
+            case CD_RIPPER_STATE_IDLE:
+            default:
+                snprintf(rip_line, sizeof(rip_line), "F3=Rip WAV to SD  F4=WiFi files");
+                break;
+        }
     }
-    pax_draw_text(&fb, rip.state == CD_RIPPER_STATE_ERROR ? TERM_RED : TERM_DIM, pax_font_sky_mono, FONT_SIZE, 16, h - g_line_h * 2, rip_line);
+    pax_draw_text(&fb, rip_color, pax_font_sky_mono, FONT_SIZE, 16, h - g_line_h * 2, rip_line);
 
     char footer[120];
     if (play_state.playing) {
@@ -326,11 +353,23 @@ static bool handle_input(bsp_input_event_t *event) {
             return true;
         case BSP_INPUT_NAVIGATION_KEY_F3: {
             if (cd_ripper_is_active()) return false;
+            if (wifi_file_server_is_active()) return false;
             if (play_state.playing) cdplayer_stop();
             static cd_metadata_status_t meta;
             cd_metadata_get_status(&meta);
             esp_err_t res = cd_ripper_start(&cd_status, &meta);
             if (res != ESP_OK) ESP_LOGW(TAG, "Rip start failed: %s", esp_err_to_name(res));
+            return true;
+        }
+        case BSP_INPUT_NAVIGATION_KEY_F4: {
+            if (cd_ripper_is_active()) return false;
+            if (wifi_file_server_is_active()) {
+                wifi_file_server_stop();
+            } else {
+                if (play_state.playing) cdplayer_stop();
+                esp_err_t res = wifi_file_server_start();
+                if (res != ESP_OK) ESP_LOGW(TAG, "File server start failed: %s", esp_err_to_name(res));
+            }
             return true;
         }
         case BSP_INPUT_NAVIGATION_KEY_ESC:
@@ -408,6 +447,7 @@ void app_main(void) {
     ESP_ERROR_CHECK(cdrom_audio_init());
     ESP_ERROR_CHECK(cdplayer_task_init());
     ESP_ERROR_CHECK(cd_ripper_init());
+    ESP_ERROR_CHECK(wifi_file_server_init());
 
     render();
 
@@ -427,6 +467,7 @@ void app_main(void) {
         if (cd_metadata_consume_dirty()) need_redraw = true;
         if (lastfm_scrobbler_consume_dirty()) need_redraw = true;
         if (cd_ripper_consume_dirty()) need_redraw = true;
+        if (wifi_file_server_consume_dirty()) need_redraw = true;
 
         if (need_redraw) render();
     }
