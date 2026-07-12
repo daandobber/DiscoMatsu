@@ -9,7 +9,8 @@ album, track names, and cover art from MusicBrainz.
 
 - Play audio CDs from a USB CD/DVD drive.
 - Rip the inserted CD manually with `F3` to WAV files on the SD card under
-  `/sd/Music`.
+  `/sd/Music`; press `F3` again while ripping to stop and discard the partial
+  track file.
 - Share ripped files manually with `F4` over WiFi from a browser.
 - Scrobble playback to Last.fm automatically when Last.fm is configured.
 

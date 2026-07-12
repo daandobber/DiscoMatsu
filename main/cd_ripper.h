@@ -16,6 +16,7 @@ typedef enum {
     CD_RIPPER_STATE_MOUNTING_SD,
     CD_RIPPER_STATE_RIPPING,
     CD_RIPPER_STATE_DONE,
+    CD_RIPPER_STATE_CANCELLED,
     CD_RIPPER_STATE_ERROR,
 } cd_ripper_state_t;
 
@@ -30,6 +31,7 @@ typedef struct {
 
 esp_err_t cd_ripper_init(void);
 esp_err_t cd_ripper_start(const cdrom_status_t *disc, const cd_metadata_status_t *metadata);
+void cd_ripper_stop(void);
 
 void cd_ripper_get_status(cd_ripper_status_t *out);
 bool cd_ripper_is_active(void);

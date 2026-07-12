@@ -17,7 +17,7 @@
 
 static const char *TAG = "cd_ripper";
 
-#define RIP_CHUNK_SECTORS 16
+#define RIP_CHUNK_SECTORS 64
 #define RIP_CHUNK_BYTES   (RIP_CHUNK_SECTORS * CDROM_AUDIO_SECTOR_BYTES)
 
 typedef struct {
@@ -28,6 +28,7 @@ typedef struct {
 static SemaphoreHandle_t s_mutex = NULL;
 static cd_ripper_status_t s_status = {0};
 static volatile bool s_dirty = false;
+static volatile bool s_cancel_requested = false;
 
 static void publish_status(cd_ripper_state_t state, int current_track, int total_tracks, uint32_t percent,
                            const char *path, const char *error) {
@@ -178,6 +179,13 @@ static esp_err_t rip_one_track(const cdrom_track_t *track, int track_index, int 
     uint32_t lba = track->start_lba;
     uint32_t done = 0;
     while (done < sectors) {
+        if (s_cancel_requested) {
+            fclose(f);
+            unlink(path);
+            publish_status(CD_RIPPER_STATE_CANCELLED, audio_ordinal, total_audio, (done * 100u) / sectors, path, NULL);
+            return ESP_ERR_INVALID_STATE;
+        }
+
         uint16_t chunk = (sectors - done) > RIP_CHUNK_SECTORS ? RIP_CHUNK_SECTORS : (uint16_t)(sectors - done);
         esp_err_t res = cdrom_audio_read_sectors(lba, chunk, buf);
         if (res != ESP_OK) {
@@ -244,6 +252,11 @@ static void rip_task(void *arg) {
     int total_audio = count_audio_tracks(&req->disc);
     int audio_ordinal = 0;
     for (int i = 0; i < req->disc.track_count; i++) {
+        if (s_cancel_requested) {
+            publish_status(CD_RIPPER_STATE_CANCELLED, audio_ordinal, total_audio, 0, album_dir, NULL);
+            heap_caps_free(buf);
+            goto done;
+        }
         if (!req->disc.tracks[i].is_audio) continue;
         audio_ordinal++;
         res = rip_one_track(&req->disc.tracks[i], i, audio_ordinal, total_audio, &req->meta, album_dir, buf);
@@ -256,6 +269,7 @@ static void rip_task(void *arg) {
     publish_status(CD_RIPPER_STATE_DONE, total_audio, total_audio, 100, album_dir, NULL);
 
 done:
+    s_cancel_requested = false;
     free(req);
     vTaskDelete(NULL);
 }
@@ -271,6 +285,7 @@ esp_err_t cd_ripper_start(const cdrom_status_t *disc, const cd_metadata_status_t
     if (disc == NULL || metadata == NULL || !disc->disc_present || disc->track_count <= 0) return ESP_ERR_INVALID_ARG;
     if (count_audio_tracks(disc) <= 0) return ESP_ERR_INVALID_ARG;
     if (cd_ripper_is_active()) return ESP_ERR_INVALID_STATE;
+    s_cancel_requested = false;
 
     rip_request_t *req = calloc(1, sizeof(rip_request_t));
     if (req == NULL) return ESP_ERR_NO_MEM;
@@ -282,6 +297,12 @@ esp_err_t cd_ripper_start(const cdrom_status_t *disc, const cd_metadata_status_t
         return ESP_FAIL;
     }
     return ESP_OK;
+}
+
+void cd_ripper_stop(void) {
+    if (!cd_ripper_is_active()) return;
+    s_cancel_requested = true;
+    s_dirty = true;
 }
 
 void cd_ripper_get_status(cd_ripper_status_t *out) {

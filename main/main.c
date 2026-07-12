@@ -268,7 +268,7 @@ static void render_rip_focus(float w, float h, const cd_metadata_status_t *meta,
         snprintf(path_line, sizeof(path_line), "%.160s", rip->current_path);
         draw_centered_text(path_line, TERM_DIM, FONT_SIZE - 2.0f, h - g_line_h * 2.0f);
     }
-    draw_centered_text("Please wait", TERM_DIM, FONT_SIZE, h - g_line_h);
+    draw_centered_text("F3=Stop ripping", TERM_DIM, FONT_SIZE, h - g_line_h);
     blit();
 }
 
@@ -408,6 +408,9 @@ static void render(void) {
                 break;
             case CD_RIPPER_STATE_DONE:
                 snprintf(rip_line, sizeof(rip_line), "Rip done: %.140s", rip.current_path);
+                break;
+            case CD_RIPPER_STATE_CANCELLED:
+                snprintf(rip_line, sizeof(rip_line), "Rip cancelled");
                 break;
             case CD_RIPPER_STATE_ERROR:
                 snprintf(rip_line, sizeof(rip_line), "Rip error: %s", rip.last_error);
@@ -711,7 +714,10 @@ static bool handle_input(bsp_input_event_t *event) {
             cdrom_audio_eject();
             return true;
         case BSP_INPUT_NAVIGATION_KEY_F3: {
-            if (cd_ripper_is_active()) return false;
+            if (cd_ripper_is_active()) {
+                cd_ripper_stop();
+                return true;
+            }
             if (wifi_file_server_is_active()) return false;
             if (play_state.playing) cdplayer_stop();
             static cd_metadata_status_t meta;
