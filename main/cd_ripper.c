@@ -17,7 +17,7 @@
 
 static const char *TAG = "cd_ripper";
 
-#define RIP_CHUNK_SECTORS 64
+#define RIP_CHUNK_SECTORS 8
 #define RIP_CHUNK_BYTES   (RIP_CHUNK_SECTORS * CDROM_AUDIO_SECTOR_BYTES)
 
 typedef struct {
@@ -159,7 +159,7 @@ static esp_err_t rip_one_track(const cdrom_track_t *track, int track_index, int 
     build_file_name(meta, track, track_index, filename, sizeof(filename));
 
     char path[896];
-    char part_path[896];
+    char part_path[sizeof(path) + 5];
     snprintf(path, sizeof(path), "%s/%s", album_dir, filename);
     snprintf(part_path, sizeof(part_path), "%s.part", path);
     publish_status(CD_RIPPER_STATE_RIPPING, audio_ordinal, total_audio, 0, path, NULL);
@@ -195,7 +195,13 @@ static esp_err_t rip_one_track(const cdrom_track_t *track, int track_index, int 
         }
 
         uint16_t chunk = (sectors - done) > RIP_CHUNK_SECTORS ? RIP_CHUNK_SECTORS : (uint16_t)(sectors - done);
-        esp_err_t res = cdrom_audio_read_sectors(lba, chunk, buf);
+        esp_err_t res = ESP_FAIL;
+        while (chunk > 0) {
+            res = cdrom_audio_read_sectors(lba, chunk, buf);
+            if (res == ESP_OK) break;
+            if (chunk == 1) break;
+            chunk /= 2;
+        }
         if (res != ESP_OK) {
             fclose(f);
             publish_status(CD_RIPPER_STATE_ERROR, audio_ordinal, total_audio, 0, path, esp_err_to_name(res));
@@ -211,6 +217,7 @@ static esp_err_t rip_one_track(const cdrom_track_t *track, int track_index, int 
         lba += chunk;
         done += chunk;
         uint32_t percent = (done * 100u) / sectors;
+        if (percent == 0 && done > 0) percent = 1;
         if (percent != last_percent) {
             publish_status(CD_RIPPER_STATE_RIPPING, audio_ordinal, total_audio, percent, path, NULL);
             last_percent = percent;
