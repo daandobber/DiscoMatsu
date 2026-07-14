@@ -330,7 +330,19 @@ static esp_err_t list_handler(httpd_req_t *req) {
         url_encode_send(req, rel);
         httpd_resp_sendstr_chunk(req, "'>Download album (.tar)</a> <form method=get action='/cover'><input type=hidden name=path value=\"");
         html_attr_escape_send(req, rel);
-        httpd_resp_sendstr_chunk(req, "\"><button type=submit>Find cover</button></form></p><div class=list>");
+        httpd_resp_sendstr_chunk(req, "\"><button type=submit>Find cover</button></form>");
+        char cover_path[1040];
+        snprintf(cover_path, sizeof(cover_path), "%s/cover.jpg", path);
+        if (file_exists(cover_path)) {
+            char cover_rel[1040];
+            int cover_rel_len = snprintf(cover_rel, sizeof(cover_rel), "%s/cover.jpg", rel);
+            if (cover_rel_len > 0 && cover_rel_len < (int)sizeof(cover_rel)) {
+                httpd_resp_sendstr_chunk(req, " <form method=get action='/delete'><input type=hidden name=path value=\"");
+                html_attr_escape_send(req, cover_rel);
+                httpd_resp_sendstr_chunk(req, "\"><button class=danger type=submit>Delete cover</button></form>");
+            }
+        }
+        httpd_resp_sendstr_chunk(req, "</p><div class=list>");
     } else {
         httpd_resp_sendstr_chunk(req, "<div class=grid>");
     }
@@ -366,7 +378,15 @@ static esp_err_t list_handler(httpd_req_t *req) {
             httpd_resp_sendstr_chunk(req, "/'>Open</a><a class=button href='/album/");
             url_encode_send(req, rel);
             httpd_resp_sendstr_chunk(req, "'>Download</a>");
-            if (!has_cover) {
+            if (has_cover) {
+                char cover_rel[1040];
+                int cover_rel_len = snprintf(cover_rel, sizeof(cover_rel), "%s/cover.jpg", rel);
+                if (cover_rel_len > 0 && cover_rel_len < (int)sizeof(cover_rel)) {
+                    httpd_resp_sendstr_chunk(req, "<form method=get action='/delete'><input type=hidden name=path value=\"");
+                    html_attr_escape_send(req, cover_rel);
+                    httpd_resp_sendstr_chunk(req, "\"><button class=danger type=submit>Delete cover</button></form>");
+                }
+            } else {
                 httpd_resp_sendstr_chunk(req, "<form method=get action='/cover'><input type=hidden name=path value=\"");
                 html_attr_escape_send(req, rel);
                 httpd_resp_sendstr_chunk(req, "\"><button type=submit>Find cover</button></form>");
@@ -458,6 +478,41 @@ static esp_err_t delete_post_handler(httpd_req_t *req) {
     return redirect_to_music_root(req);
 }
 
+static esp_err_t save_cover_for_release(const char *album_dir, const char *release_id, uint8_t *buf) {
+    char url[768];
+    snprintf(url, sizeof(url), "https://coverartarchive.org/release/%s/front-250", release_id);
+
+    size_t len = 0;
+    int status = 0;
+    esp_err_t res = http_get_capture(url, buf, COVER_HTTP_BUF_SIZE, &len, &status);
+    if (res != ESP_OK || status != 200 || len == 0) {
+        return res != ESP_OK ? res : ESP_FAIL;
+    }
+
+    size_t jpeg_start = 0;
+    while (jpeg_start + 2 < len && !(buf[jpeg_start] == 0xFF && buf[jpeg_start + 1] == 0xD8 && buf[jpeg_start + 2] == 0xFF)) {
+        jpeg_start++;
+    }
+    if (jpeg_start + 2 >= len) {
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
+    char cover_path[1040];
+    int path_len = snprintf(cover_path, sizeof(cover_path), "%s/cover.jpg", album_dir);
+    if (path_len < 0 || path_len >= (int)sizeof(cover_path)) {
+        return ESP_FAIL;
+    }
+
+    FILE *f = fopen(cover_path, "wb");
+    if (f == NULL) {
+        return ESP_FAIL;
+    }
+    size_t jpeg_len = len - jpeg_start;
+    size_t written = fwrite(buf + jpeg_start, 1, jpeg_len, f);
+    int close_res = fclose(f);
+    return written == jpeg_len && close_res == 0 ? ESP_OK : ESP_FAIL;
+}
+
 static esp_err_t save_album_cover_from_query(const char *album_dir, const char *query) {
     uint8_t *buf = malloc(COVER_HTTP_BUF_SIZE);
     if (buf == NULL) return ESP_ERR_NO_MEM;
@@ -469,7 +524,7 @@ static esp_err_t save_album_cover_from_query(const char *album_dir, const char *
     }
 
     char url[768];
-    snprintf(url, sizeof(url), "https://musicbrainz.org/ws/2/release/?fmt=json&limit=1&query=%s", encoded);
+    snprintf(url, sizeof(url), "https://musicbrainz.org/ws/2/release/?fmt=json&limit=10&query=%s", encoded);
 
     size_t len = 0;
     int status = 0;
@@ -480,51 +535,23 @@ static esp_err_t save_album_cover_from_query(const char *album_dir, const char *
     }
     buf[len] = '\0';
 
-    char release_id[64] = {0};
+    esp_err_t last_res = ESP_ERR_NOT_FOUND;
     cJSON *root = cJSON_ParseWithLength((const char *)buf, len);
     cJSON *releases = root != NULL ? cJSON_GetObjectItem(root, "releases") : NULL;
-    cJSON *release = cJSON_IsArray(releases) ? cJSON_GetArrayItem(releases, 0) : NULL;
-    cJSON *id = release != NULL ? cJSON_GetObjectItem(release, "id") : NULL;
-    if (cJSON_IsString(id)) snprintf(release_id, sizeof(release_id), "%s", id->valuestring);
+    if (cJSON_IsArray(releases)) {
+        int release_count = cJSON_GetArraySize(releases);
+        for (int i = 0; i < release_count; i++) {
+            cJSON *release = cJSON_GetArrayItem(releases, i);
+            cJSON *id = release != NULL ? cJSON_GetObjectItem(release, "id") : NULL;
+            if (!cJSON_IsString(id)) continue;
+
+            last_res = save_cover_for_release(album_dir, id->valuestring, buf);
+            if (last_res == ESP_OK) break;
+        }
+    }
     if (root != NULL) cJSON_Delete(root);
-    if (release_id[0] == '\0') {
-        free(buf);
-        return ESP_ERR_NOT_FOUND;
-    }
-
-    snprintf(url, sizeof(url), "https://coverartarchive.org/release/%s/front-250", release_id);
-    res = http_get_capture(url, buf, COVER_HTTP_BUF_SIZE, &len, &status);
-    if (res != ESP_OK || status != 200 || len == 0) {
-        free(buf);
-        return res != ESP_OK ? res : ESP_FAIL;
-    }
-
-    size_t jpeg_start = 0;
-    while (jpeg_start + 2 < len && !(buf[jpeg_start] == 0xFF && buf[jpeg_start + 1] == 0xD8 && buf[jpeg_start + 2] == 0xFF)) {
-        jpeg_start++;
-    }
-    if (jpeg_start + 2 >= len) {
-        free(buf);
-        return ESP_ERR_INVALID_RESPONSE;
-    }
-
-    char cover_path[1040];
-    int path_len = snprintf(cover_path, sizeof(cover_path), "%s/cover.jpg", album_dir);
-    if (path_len < 0 || path_len >= (int)sizeof(cover_path)) {
-        free(buf);
-        return ESP_FAIL;
-    }
-
-    FILE *f = fopen(cover_path, "wb");
-    if (f == NULL) {
-        free(buf);
-        return ESP_FAIL;
-    }
-    size_t jpeg_len = len - jpeg_start;
-    size_t written = fwrite(buf + jpeg_start, 1, jpeg_len, f);
-    int close_res = fclose(f);
     free(buf);
-    return written == jpeg_len && close_res == 0 ? ESP_OK : ESP_FAIL;
+    return last_res;
 }
 
 static void build_cover_default_query(const char *album_name, char *out, size_t out_len) {
@@ -572,9 +599,14 @@ static esp_err_t cover_get_handler(httpd_req_t *req) {
     build_cover_default_query(path_basename(path), default_query, sizeof(default_query));
 
     char query_string[768];
+    char raw_query[256] = {0};
     char query[256] = {0};
     if (httpd_req_get_url_query_str(req, query_string, sizeof(query_string)) == ESP_OK) {
-        httpd_query_key_value(query_string, "q", query, sizeof(query));
+        if (httpd_query_key_value(query_string, "q", raw_query, sizeof(raw_query)) == ESP_OK) {
+            if (!url_decode(raw_query, query, sizeof(query))) {
+                snprintf(query, sizeof(query), "%s", raw_query);
+            }
+        }
     }
 
     if (query[0] == '\0') {
