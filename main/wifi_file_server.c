@@ -325,23 +325,32 @@ static esp_err_t tar_send_dir(httpd_req_t *req, const char *path, const char *ta
     struct stat st;
     if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) return ESP_FAIL;
 
-    char dir_name[768];
-    snprintf(dir_name, sizeof(dir_name), "%s/", tar_name);
+    char *dir_name = malloc(768);
+    if (dir_name == NULL) return ESP_ERR_NO_MEM;
+    snprintf(dir_name, 768, "%s/", tar_name);
     esp_err_t res = tar_send_header(req, dir_name, &st, '5');
+    free(dir_name);
     if (res != ESP_OK) return res;
 
     DIR *dir = opendir(path);
     if (dir == NULL) return ESP_FAIL;
 
+    char *child_path = malloc(1024);
+    char *child_name = malloc(768);
+    if (child_path == NULL || child_name == NULL) {
+        free(child_path);
+        free(child_name);
+        closedir(dir);
+        return ESP_ERR_NO_MEM;
+    }
+
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_name[0] == '.') continue;
 
-        char child_path[1024];
-        char child_name[768];
-        int path_len = snprintf(child_path, sizeof(child_path), "%s/%s", path, entry->d_name);
-        int name_len = snprintf(child_name, sizeof(child_name), "%s/%s", tar_name, entry->d_name);
-        if (path_len < 0 || path_len >= (int)sizeof(child_path) || name_len < 0 || name_len >= (int)sizeof(child_name)) {
+        int path_len = snprintf(child_path, 1024, "%s/%s", path, entry->d_name);
+        int name_len = snprintf(child_name, 768, "%s/%s", tar_name, entry->d_name);
+        if (path_len < 0 || path_len >= 1024 || name_len < 0 || name_len >= 768) {
             continue;
         }
 
@@ -353,10 +362,14 @@ static esp_err_t tar_send_dir(httpd_req_t *req, const char *path, const char *ta
             res = tar_send_file(req, child_path, child_name, &child_st);
         }
         if (res != ESP_OK) {
+            free(child_path);
+            free(child_name);
             closedir(dir);
             return res;
         }
     }
+    free(child_path);
+    free(child_name);
     closedir(dir);
     return ESP_OK;
 }
@@ -407,7 +420,7 @@ static esp_err_t start_http_server(char *url, size_t url_len) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.uri_match_fn = httpd_uri_match_wildcard;
     config.max_open_sockets = 4;
-    config.stack_size = 8192;
+    config.stack_size = 12288;
 
     esp_err_t res = httpd_start(&s_server, &config);
     if (res != ESP_OK) return res;
