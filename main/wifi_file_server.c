@@ -77,6 +77,23 @@ static void html_escape_send(httpd_req_t *req, const char *text) {
     }
 }
 
+static void html_attr_escape_send(httpd_req_t *req, const char *text) {
+    for (const char *p = text; *p != '\0'; p++) {
+        switch (*p) {
+            case '&': httpd_resp_sendstr_chunk(req, "&amp;"); break;
+            case '<': httpd_resp_sendstr_chunk(req, "&lt;"); break;
+            case '>': httpd_resp_sendstr_chunk(req, "&gt;"); break;
+            case '"': httpd_resp_sendstr_chunk(req, "&quot;"); break;
+            case '\'': httpd_resp_sendstr_chunk(req, "&#39;"); break;
+            default: {
+                char c[2] = {*p, '\0'};
+                httpd_resp_sendstr_chunk(req, c);
+                break;
+            }
+        }
+    }
+}
+
 static void url_encode_send(httpd_req_t *req, const char *text) {
     static const char hex[] = "0123456789ABCDEF";
     char out[4];
@@ -137,6 +154,7 @@ static esp_err_t http_get_capture(const char *url, uint8_t *buf, size_t cap, siz
         .event_handler = capture_http_event,
         .user_data = &capture,
         .user_agent = USER_AGENT,
+        .max_redirection_count = 5,
     };
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -186,6 +204,31 @@ static bool build_safe_path(const char *encoded_rel, char *out, size_t out_len) 
         snprintf(out, out_len, "%s/%s", MUSIC_ROOT, rel);
     }
     return true;
+}
+
+static bool build_safe_path_from_query(httpd_req_t *req, char *out, size_t out_len) {
+    size_t query_len = httpd_req_get_url_query_len(req);
+    if (query_len == 0 || query_len >= 768) return false;
+
+    char query[768];
+    if (httpd_req_get_url_query_str(req, query, sizeof(query)) != ESP_OK) return false;
+
+    char encoded_rel[768];
+    if (httpd_query_key_value(query, "path", encoded_rel, sizeof(encoded_rel)) != ESP_OK) return false;
+    return build_safe_path(encoded_rel, out, out_len);
+}
+
+static bool build_safe_path_from_form(httpd_req_t *req, char *out, size_t out_len) {
+    if (req->content_len == 0 || req->content_len >= 768) return false;
+
+    char body[768];
+    int received = httpd_req_recv(req, body, req->content_len);
+    if (received <= 0 || received >= (int)sizeof(body)) return false;
+    body[received] = '\0';
+
+    char encoded_rel[768];
+    if (httpd_query_key_value(body, "path", encoded_rel, sizeof(encoded_rel)) != ESP_OK) return false;
+    return build_safe_path(encoded_rel, out, out_len);
 }
 
 static void trim_trailing_slashes(char *path) {
@@ -285,9 +328,9 @@ static esp_err_t list_handler(httpd_req_t *req) {
         if (*rel == '/') rel++;
         httpd_resp_sendstr_chunk(req, "<p><a class=button href='/browse/'>Back</a> <a class='button primary' href='/album/");
         url_encode_send(req, rel);
-        httpd_resp_sendstr_chunk(req, "'>Download album (.tar)</a> <form method=post action='/cover/");
-        url_encode_send(req, rel);
-        httpd_resp_sendstr_chunk(req, "'><button type=submit>Find cover</button></form></p><div class=list>");
+        httpd_resp_sendstr_chunk(req, "'>Download album (.tar)</a> <form method=get action='/cover'><input type=hidden name=path value=\"");
+        html_attr_escape_send(req, rel);
+        httpd_resp_sendstr_chunk(req, "\"><button type=submit>Find cover</button></form></p><div class=list>");
     } else {
         httpd_resp_sendstr_chunk(req, "<div class=grid>");
     }
@@ -324,13 +367,13 @@ static esp_err_t list_handler(httpd_req_t *req) {
             url_encode_send(req, rel);
             httpd_resp_sendstr_chunk(req, "'>Download</a>");
             if (!has_cover) {
-                httpd_resp_sendstr_chunk(req, "<form method=post action='/cover/");
-                url_encode_send(req, rel);
-                httpd_resp_sendstr_chunk(req, "'><button type=submit>Find cover</button></form>");
+                httpd_resp_sendstr_chunk(req, "<form method=get action='/cover'><input type=hidden name=path value=\"");
+                html_attr_escape_send(req, rel);
+                httpd_resp_sendstr_chunk(req, "\"><button type=submit>Find cover</button></form>");
             }
-            httpd_resp_sendstr_chunk(req, "<form method=get action='/delete/");
-            url_encode_send(req, rel);
-            httpd_resp_sendstr_chunk(req, "'><button class=danger type=submit>Delete</button></form></div></div></article>");
+            httpd_resp_sendstr_chunk(req, "<form method=get action='/delete'><input type=hidden name=path value=\"");
+            html_attr_escape_send(req, rel);
+            httpd_resp_sendstr_chunk(req, "\"><button class=danger type=submit>Delete</button></form></div></div></article>");
         } else {
             httpd_resp_sendstr_chunk(req, "<div class=row><a href='");
             httpd_resp_sendstr_chunk(req, S_ISDIR(st.st_mode) ? "/browse/" : "/file/");
@@ -344,9 +387,9 @@ static esp_err_t list_handler(httpd_req_t *req) {
                 snprintf(size, sizeof(size), " <small>%ld MB</small>", (long)((st.st_size + 1024 * 1024 - 1) / (1024 * 1024)));
                 httpd_resp_sendstr_chunk(req, size);
             }
-            httpd_resp_sendstr_chunk(req, "</a><form method=get action='/delete/");
-            url_encode_send(req, rel);
-            httpd_resp_sendstr_chunk(req, "'><button class=danger type=submit>Delete</button></form></div>");
+            httpd_resp_sendstr_chunk(req, "</a><form method=get action='/delete'><input type=hidden name=path value=\"");
+            html_attr_escape_send(req, rel);
+            httpd_resp_sendstr_chunk(req, "\"><button class=danger type=submit>Delete</button></form></div>");
         }
     }
     closedir(dir);
@@ -357,8 +400,7 @@ static esp_err_t list_handler(httpd_req_t *req) {
 
 static esp_err_t delete_confirm_handler(httpd_req_t *req) {
     char path[1024];
-    const char *encoded_rel = req->uri + strlen("/delete/");
-    if (!build_safe_path(encoded_rel, path, sizeof(path))) {
+    if (!build_safe_path_from_query(req, path, sizeof(path))) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad path");
         return ESP_OK;
     }
@@ -384,11 +426,13 @@ static esp_err_t delete_confirm_handler(httpd_req_t *req) {
     );
     html_escape_send(req, path_basename(path));
     httpd_resp_sendstr_chunk(req, S_ISDIR(st.st_mode) ? "</p><p>This deletes the whole album folder.</p>" : "</p>");
-    httpd_resp_sendstr_chunk(req, "<form method=post action='/delete/");
-    httpd_resp_sendstr_chunk(req, encoded_rel);
+    const char *rel = path + strlen(MUSIC_ROOT);
+    if (*rel == '/') rel++;
+    httpd_resp_sendstr_chunk(req, "<form method=post action='/delete'><input type=hidden name=path value=\"");
+    html_attr_escape_send(req, rel);
     httpd_resp_sendstr_chunk(
         req,
-        "'><button class=danger type=submit>Delete</button> <a class=button href='/browse/'>Cancel</a></form>"
+        "\"><button class=danger type=submit>Delete</button> <a class=button href='/browse/'>Cancel</a></form>"
     );
     httpd_resp_sendstr_chunk(req, NULL);
     return ESP_OK;
@@ -396,8 +440,7 @@ static esp_err_t delete_confirm_handler(httpd_req_t *req) {
 
 static esp_err_t delete_post_handler(httpd_req_t *req) {
     char path[1024];
-    const char *encoded_rel = req->uri + strlen("/delete/");
-    if (!build_safe_path(encoded_rel, path, sizeof(path))) {
+    if (!build_safe_path_from_form(req, path, sizeof(path))) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad path");
         return ESP_OK;
     }
@@ -456,6 +499,15 @@ static esp_err_t save_album_cover_from_query(const char *album_dir, const char *
         return res != ESP_OK ? res : ESP_FAIL;
     }
 
+    size_t jpeg_start = 0;
+    while (jpeg_start + 2 < len && !(buf[jpeg_start] == 0xFF && buf[jpeg_start + 1] == 0xD8 && buf[jpeg_start + 2] == 0xFF)) {
+        jpeg_start++;
+    }
+    if (jpeg_start + 2 >= len) {
+        free(buf);
+        return ESP_ERR_INVALID_RESPONSE;
+    }
+
     char cover_path[1040];
     int path_len = snprintf(cover_path, sizeof(cover_path), "%s/cover.jpg", album_dir);
     if (path_len < 0 || path_len >= (int)sizeof(cover_path)) {
@@ -468,16 +520,39 @@ static esp_err_t save_album_cover_from_query(const char *album_dir, const char *
         free(buf);
         return ESP_FAIL;
     }
-    size_t written = fwrite(buf, 1, len, f);
+    size_t jpeg_len = len - jpeg_start;
+    size_t written = fwrite(buf + jpeg_start, 1, jpeg_len, f);
     int close_res = fclose(f);
     free(buf);
-    return written == len && close_res == 0 ? ESP_OK : ESP_FAIL;
+    return written == jpeg_len && close_res == 0 ? ESP_OK : ESP_FAIL;
 }
 
-static esp_err_t cover_post_handler(httpd_req_t *req) {
+static void build_cover_default_query(const char *album_name, char *out, size_t out_len) {
+    char cleaned[256];
+    snprintf(cleaned, sizeof(cleaned), "%s", album_name);
+
+    size_t len = strlen(cleaned);
+    if (len > 7 && cleaned[len - 1] == ')' && isdigit((unsigned char)cleaned[len - 2]) &&
+        isdigit((unsigned char)cleaned[len - 3]) && isdigit((unsigned char)cleaned[len - 4]) &&
+        isdigit((unsigned char)cleaned[len - 5]) && cleaned[len - 6] == '(') {
+        cleaned[len - 7] = '\0';
+    }
+
+    len = strlen(cleaned);
+    if (len > 6 && isdigit((unsigned char)cleaned[len - 1]) && cleaned[len - 2] == 'D' && cleaned[len - 3] == 'C' &&
+        cleaned[len - 4] == ' ' && cleaned[len - 5] == '-' && cleaned[len - 6] == ' ') {
+        cleaned[len - 6] = '\0';
+    }
+
+    for (char *p = cleaned; *p != '\0'; p++) {
+        if (*p == '_' || *p == '(' || *p == ')' || *p == '-') *p = ' ';
+    }
+    snprintf(out, out_len, "%.160s", cleaned);
+}
+
+static esp_err_t cover_get_handler(httpd_req_t *req) {
     char path[1024];
-    const char *encoded_rel = req->uri + strlen("/cover/");
-    if (!build_safe_path(encoded_rel, path, sizeof(path))) {
+    if (!build_safe_path_from_query(req, path, sizeof(path))) {
         httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad path");
         return ESP_OK;
     }
@@ -493,10 +568,53 @@ static esp_err_t cover_post_handler(httpd_req_t *req) {
         return ESP_OK;
     }
 
-    esp_err_t res = save_album_cover_from_query(path, path_basename(path));
+    char default_query[256];
+    build_cover_default_query(path_basename(path), default_query, sizeof(default_query));
+
+    char query_string[768];
+    char query[256] = {0};
+    if (httpd_req_get_url_query_str(req, query_string, sizeof(query_string)) == ESP_OK) {
+        httpd_query_key_value(query_string, "q", query, sizeof(query));
+    }
+
+    if (query[0] == '\0') {
+        const char *rel = path + strlen(MUSIC_ROOT);
+        if (*rel == '/') rel++;
+        httpd_resp_set_type(req, "text/html; charset=utf-8");
+        httpd_resp_sendstr_chunk(
+            req,
+            "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>Find cover</title><style>body{font-family:system-ui,sans-serif;margin:24px;line-height:1.4}"
+            "input{font:inherit;padding:8px;width:min(520px,100%)}button,.button{font:inherit;padding:8px 12px;border:1px solid #bbb;border-radius:6px;background:#f8f8f8;color:#111;text-decoration:none}</style>"
+            "<h1>Find cover</h1><form method=get action='/cover'><input type=hidden name=path value=\""
+        );
+        html_attr_escape_send(req, rel);
+        httpd_resp_sendstr_chunk(req, "\"><p><input name=q value=\"");
+        html_attr_escape_send(req, default_query);
+        httpd_resp_sendstr_chunk(
+            req,
+            "\"></p><button type=submit>Search cover</button> <a class=button href='/browse/'>Cancel</a></form>"
+        );
+        httpd_resp_sendstr_chunk(req, NULL);
+        return ESP_OK;
+    }
+
+    esp_err_t res = save_album_cover_from_query(path, query);
     if (res != ESP_OK) {
-        ESP_LOGW(TAG, "Cover lookup failed: %s", esp_err_to_name(res));
-        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Cover lookup failed");
+        ESP_LOGW(TAG, "Cover lookup failed for '%s': %s", query, esp_err_to_name(res));
+        httpd_resp_set_type(req, "text/html; charset=utf-8");
+        httpd_resp_sendstr_chunk(
+            req,
+            "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>Cover not found</title><style>body{font-family:system-ui,sans-serif;margin:24px;line-height:1.4}"
+            ".button{display:inline-block;padding:8px 12px;border:1px solid #bbb;border-radius:6px;background:#f8f8f8;color:#111;text-decoration:none}</style>"
+            "<h1>Cover not found</h1><p>Try a different query, for example the exact album title.</p><p><a class=button href='/cover?path="
+        );
+        const char *rel = path + strlen(MUSIC_ROOT);
+        if (*rel == '/') rel++;
+        url_encode_send(req, rel);
+        httpd_resp_sendstr_chunk(req, "'>Try again</a> <a class=button href='/browse/'>Back</a></p>");
+        httpd_resp_sendstr_chunk(req, NULL);
         return ESP_OK;
     }
     return redirect_to_music_root(req);
@@ -755,19 +873,19 @@ static esp_err_t start_http_server(char *url, size_t url_len) {
         .handler = album_handler,
     };
     httpd_uri_t delete_get = {
-        .uri = "/delete/*",
+        .uri = "/delete",
         .method = HTTP_GET,
         .handler = delete_confirm_handler,
     };
     httpd_uri_t delete_post = {
-        .uri = "/delete/*",
+        .uri = "/delete",
         .method = HTTP_POST,
         .handler = delete_post_handler,
     };
-    httpd_uri_t cover_post = {
-        .uri = "/cover/*",
-        .method = HTTP_POST,
-        .handler = cover_post_handler,
+    httpd_uri_t cover_get = {
+        .uri = "/cover",
+        .method = HTTP_GET,
+        .handler = cover_get_handler,
     };
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &root));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &browse));
@@ -775,7 +893,7 @@ static esp_err_t start_http_server(char *url, size_t url_len) {
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &album));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &delete_get));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &delete_post));
-    ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &cover_post));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &cover_get));
 
     get_ip_url(url, url_len);
     return ESP_OK;
