@@ -128,6 +128,18 @@ static bool build_safe_path(const char *encoded_rel, char *out, size_t out_len) 
     return true;
 }
 
+static void trim_trailing_slashes(char *path) {
+    size_t len = strlen(path);
+    while (len > 1 && path[len - 1] == '/') {
+        path[--len] = '\0';
+    }
+}
+
+static const char *path_basename(const char *path) {
+    const char *name = strrchr(path, '/');
+    return name != NULL ? name + 1 : path;
+}
+
 static esp_err_t list_handler(httpd_req_t *req) {
     char path[1024];
     const char *encoded_rel = req->uri;
@@ -155,6 +167,7 @@ static esp_err_t list_handler(httpd_req_t *req) {
 
     if (strcmp(path, MUSIC_ROOT) != 0) {
         httpd_resp_sendstr_chunk(req, "<a href='/browse/'>../</a>");
+        trim_trailing_slashes(path);
         const char *rel = path + strlen(MUSIC_ROOT);
         if (*rel == '/') rel++;
         httpd_resp_sendstr_chunk(req, "<a href='/album/");
@@ -209,8 +222,7 @@ static esp_err_t file_handler(httpd_req_t *req) {
 
     httpd_resp_set_type(req, content_type_for_path(path));
     const char *name = strrchr(path, '/');
-    if (name == NULL) name = path;
-    else name++;
+    name = name == NULL ? path : name + 1;
     char disposition[256];
     snprintf(disposition, sizeof(disposition), "attachment; filename=\"%.220s\"", name);
     httpd_resp_set_hdr(req, "Content-Disposition", disposition);
@@ -387,9 +399,10 @@ static esp_err_t album_handler(httpd_req_t *req) {
         httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Album not found");
         return ESP_OK;
     }
+    trim_trailing_slashes(path);
 
-    const char *name = strrchr(path, '/');
-    name = name != NULL ? name + 1 : "album";
+    const char *name = path_basename(path);
+    if (name[0] == '\0') name = "album";
 
     httpd_resp_set_type(req, "application/x-tar");
     char disposition[280];
