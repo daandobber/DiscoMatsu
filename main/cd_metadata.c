@@ -30,6 +30,8 @@ static cd_metadata_status_t s_status      = {0};
 static cd_metadata_search_status_t s_search = {0};
 static volatile bool s_dirty              = false;
 static uint16_t *s_cover_art               = NULL;
+static uint8_t *s_cover_jpeg               = NULL;
+static size_t s_cover_jpeg_len             = 0;
 
 typedef struct {
     cdrom_track_t tracks[CDROM_AUDIO_MAX_TRACKS];
@@ -48,6 +50,37 @@ typedef struct {
 
 static esp_err_t http_get(const char *url, uint8_t *out_buf, size_t cap, size_t *out_len, int *out_status);
 static void decode_and_store_cover_art(const uint8_t *jpeg_data, size_t jpeg_len);
+static int find_jpeg_start(const uint8_t *data, size_t len);
+
+static void clear_cover_jpeg(void) {
+    if (s_cover_jpeg != NULL) {
+        heap_caps_free(s_cover_jpeg);
+        s_cover_jpeg = NULL;
+    }
+    s_cover_jpeg_len = 0;
+}
+
+static void store_cover_jpeg(const uint8_t *jpeg_data, size_t jpeg_len) {
+    int jpeg_start = find_jpeg_start(jpeg_data, jpeg_len);
+    if (jpeg_start < 0) return;
+
+    jpeg_data += jpeg_start;
+    jpeg_len -= (size_t)jpeg_start;
+
+    uint8_t *copy = heap_caps_malloc(jpeg_len, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (copy == NULL) copy = heap_caps_malloc(jpeg_len, MALLOC_CAP_8BIT);
+    if (copy == NULL) {
+        ESP_LOGW(TAG, "No memory to keep cover JPEG (%u bytes)", (unsigned)jpeg_len);
+        return;
+    }
+
+    memcpy(copy, jpeg_data, jpeg_len);
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    clear_cover_jpeg();
+    s_cover_jpeg = copy;
+    s_cover_jpeg_len = jpeg_len;
+    xSemaphoreGive(s_mutex);
+}
 
 static void set_state(cd_metadata_state_t state) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
@@ -303,6 +336,7 @@ static void fetch_cover_art(const char *release_mbid) {
     int jstatus = 0;
     esp_err_t jerr = http_get(art_url, jbuf, JPEG_BUF_CAP, &jlen, &jstatus);
     if (jerr == ESP_OK && jstatus == 200 && jlen > 0) {
+        store_cover_jpeg(jbuf, jlen);
         decode_and_store_cover_art(jbuf, jlen);
     } else {
         ESP_LOGI(TAG, "No cover art available (status=%d)", jstatus);
@@ -779,6 +813,7 @@ void cd_metadata_clear(void) {
         heap_caps_free(s_cover_art);
         s_cover_art = NULL;
     }
+    clear_cover_jpeg();
     xSemaphoreGive(s_mutex);
     s_dirty = true;
 }
@@ -799,4 +834,25 @@ bool cd_metadata_consume_dirty(void) {
     bool was_dirty = s_dirty;
     s_dirty         = false;
     return was_dirty;
+}
+
+esp_err_t cd_metadata_save_cover_jpeg(const char *path) {
+    if (path == NULL) return ESP_ERR_INVALID_ARG;
+
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    if (s_cover_jpeg == NULL || s_cover_jpeg_len == 0) {
+        xSemaphoreGive(s_mutex);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    FILE *f = fopen(path, "wb");
+    if (f == NULL) {
+        xSemaphoreGive(s_mutex);
+        return ESP_FAIL;
+    }
+
+    size_t written = fwrite(s_cover_jpeg, 1, s_cover_jpeg_len, f);
+    int close_res  = fclose(f);
+    xSemaphoreGive(s_mutex);
+    return written == s_cover_jpeg_len && close_res == 0 ? ESP_OK : ESP_FAIL;
 }

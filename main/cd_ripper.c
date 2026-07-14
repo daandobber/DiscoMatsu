@@ -270,6 +270,13 @@ static void rip_task(void *arg) {
         goto done;
     }
 
+    char cover_path[544];
+    snprintf(cover_path, sizeof(cover_path), "%s/cover.jpg", album_dir);
+    res = cd_metadata_save_cover_jpeg(cover_path);
+    if (res != ESP_OK && res != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "Cover art save failed: %s", esp_err_to_name(res));
+    }
+
     uint8_t *buf = heap_caps_malloc(RIP_CHUNK_BYTES, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (buf == NULL) buf = heap_caps_malloc(RIP_CHUNK_BYTES, MALLOC_CAP_8BIT);
     if (buf == NULL) {

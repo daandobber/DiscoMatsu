@@ -140,6 +140,11 @@ static const char *path_basename(const char *path) {
     return name != NULL ? name + 1 : path;
 }
 
+static bool file_exists(const char *path) {
+    struct stat st;
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
 static esp_err_t list_handler(httpd_req_t *req) {
     char path[1024];
     const char *encoded_rel = req->uri;
@@ -160,19 +165,27 @@ static esp_err_t list_handler(httpd_req_t *req) {
         req,
         "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
         "<title>Disc-O-Matsu files</title>"
-        "<style>body{font-family:system-ui,sans-serif;margin:24px;line-height:1.4}"
-        "a{display:block;padding:8px 0;color:#0645ad}small{color:#666}</style>"
-        "<h1>Disc-O-Matsu</h1><small>/sd/Music</small><hr>"
+        "<style>body{font-family:system-ui,sans-serif;margin:24px;line-height:1.4;background:#f6f5f2;color:#181818}"
+        "a{color:#0645ad}.top{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:18px}"
+        "h1{margin:0;font-size:28px}.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:16px}"
+        ".album{background:#fff;border:1px solid #ddd;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px #0001}"
+        ".cover{aspect-ratio:1;background:#ddd;display:block;width:100%;object-fit:cover}"
+        ".blank{aspect-ratio:1;background:linear-gradient(135deg,#333,#777);display:flex;align-items:center;justify-content:center;color:white;font-size:42px}"
+        ".body{padding:12px}.name{font-weight:650;margin-bottom:10px;overflow-wrap:anywhere}.actions{display:flex;gap:8px;flex-wrap:wrap}"
+        ".button{display:inline-block;text-decoration:none;border:1px solid #bbb;border-radius:6px;padding:7px 10px;background:#f8f8f8;color:#111}"
+        ".primary{background:#111;color:#fff;border-color:#111}.list a{display:block;padding:8px 0}</style>"
+        "<div class=top><h1>Disc-O-Matsu</h1><small>/sd/Music</small></div>"
     );
 
     if (strcmp(path, MUSIC_ROOT) != 0) {
-        httpd_resp_sendstr_chunk(req, "<a href='/browse/'>../</a>");
         trim_trailing_slashes(path);
         const char *rel = path + strlen(MUSIC_ROOT);
         if (*rel == '/') rel++;
-        httpd_resp_sendstr_chunk(req, "<a href='/album/");
+        httpd_resp_sendstr_chunk(req, "<p><a class=button href='/browse/'>Back</a> <a class='button primary' href='/album/");
         url_encode_send(req, rel);
-        httpd_resp_sendstr_chunk(req, "'>Download album (.tar)</a><hr>");
+        httpd_resp_sendstr_chunk(req, "'>Download album (.tar)</a></p><div class=list>");
+    } else {
+        httpd_resp_sendstr_chunk(req, "<div class=grid>");
     }
 
     struct dirent *entry;
@@ -187,21 +200,42 @@ static esp_err_t list_handler(httpd_req_t *req) {
 
         const char *rel = full + strlen(MUSIC_ROOT);
         if (*rel == '/') rel++;
-        httpd_resp_sendstr_chunk(req, "<a href='");
-        httpd_resp_sendstr_chunk(req, S_ISDIR(st.st_mode) ? "/browse/" : "/file/");
-        url_encode_send(req, rel);
-        httpd_resp_sendstr_chunk(req, S_ISDIR(st.st_mode) ? "/'>" : "'>");
-        html_escape_send(req, entry->d_name);
-        if (S_ISDIR(st.st_mode)) {
-            httpd_resp_sendstr_chunk(req, "/");
+        if (strcmp(path, MUSIC_ROOT) == 0 && S_ISDIR(st.st_mode)) {
+            char cover_path[1040];
+            snprintf(cover_path, sizeof(cover_path), "%s/cover.jpg", full);
+            httpd_resp_sendstr_chunk(req, "<article class=album>");
+            if (file_exists(cover_path)) {
+                httpd_resp_sendstr_chunk(req, "<img class=cover src='/file/");
+                url_encode_send(req, rel);
+                httpd_resp_sendstr_chunk(req, "/cover.jpg'>");
+            } else {
+                httpd_resp_sendstr_chunk(req, "<div class=blank>CD</div>");
+            }
+            httpd_resp_sendstr_chunk(req, "<div class=body><div class=name>");
+            html_escape_send(req, entry->d_name);
+            httpd_resp_sendstr_chunk(req, "</div><div class=actions><a class='button primary' href='/browse/");
+            url_encode_send(req, rel);
+            httpd_resp_sendstr_chunk(req, "/'>Open</a><a class=button href='/album/");
+            url_encode_send(req, rel);
+            httpd_resp_sendstr_chunk(req, "'>Download</a></div></div></article>");
         } else {
-            char size[48];
-            snprintf(size, sizeof(size), " <small>%ld MB</small>", (long)((st.st_size + 1024 * 1024 - 1) / (1024 * 1024)));
-            httpd_resp_sendstr_chunk(req, size);
+            httpd_resp_sendstr_chunk(req, "<a href='");
+            httpd_resp_sendstr_chunk(req, S_ISDIR(st.st_mode) ? "/browse/" : "/file/");
+            url_encode_send(req, rel);
+            httpd_resp_sendstr_chunk(req, S_ISDIR(st.st_mode) ? "/'>" : "'>");
+            html_escape_send(req, entry->d_name);
+            if (S_ISDIR(st.st_mode)) {
+                httpd_resp_sendstr_chunk(req, "/");
+            } else {
+                char size[48];
+                snprintf(size, sizeof(size), " <small>%ld MB</small>", (long)((st.st_size + 1024 * 1024 - 1) / (1024 * 1024)));
+                httpd_resp_sendstr_chunk(req, size);
+            }
+            httpd_resp_sendstr_chunk(req, "</a>");
         }
-        httpd_resp_sendstr_chunk(req, "</a>");
     }
     closedir(dir);
+    httpd_resp_sendstr_chunk(req, "</div>");
     httpd_resp_sendstr_chunk(req, NULL);
     return ESP_OK;
 }

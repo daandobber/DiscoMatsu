@@ -72,6 +72,7 @@ void cd_metadata_clear(void);
 void cd_metadata_get_status(cd_metadata_status_t *out);
 void cd_metadata_get_search_status(cd_metadata_search_status_t *out);
 bool cd_metadata_consume_dirty(void);
+esp_err_t cd_metadata_save_cover_jpeg(const char *path);
 
 #ifdef __cplusplus
 }
