@@ -15,6 +15,13 @@ album, track names, and cover art from MusicBrainz.
   whole-album `.tar` download from each album folder.
 - Scrobble playback to Last.fm automatically when Last.fm is configured.
 
+## Known issues
+
+- Album art lookup from the WiFi file browser does not reliably download cover
+  art yet.
+- Album art cannot be deleted separately from the WiFi file browser yet, so a
+  bad `cover.jpg` currently has to be removed from the SD card manually.
+
 WAV rips use this layout:
 
 ```text
