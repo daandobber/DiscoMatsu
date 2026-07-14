@@ -6,8 +6,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/unistd.h>
 
+#include "cJSON.h"
+#include "esp_crt_bundle.h"
 #include "esp_http_server.h"
+#include "esp_http_client.h"
 #include "esp_log.h"
 #include "esp_netif.h"
 #include "freertos/FreeRTOS.h"
@@ -21,6 +25,8 @@ static const char *TAG = "wifi_file_server";
 #define MUSIC_ROOT SD_STORAGE_MOUNT_POINT "/Music"
 #define FILE_CHUNK_SIZE 2048
 #define TAR_BLOCK_SIZE 512
+#define COVER_HTTP_BUF_SIZE (128 * 1024)
+#define USER_AGENT "Disc-O-Matsu/0.1"
 
 static SemaphoreHandle_t s_mutex = NULL;
 static wifi_file_server_status_t s_status = {0};
@@ -88,6 +94,60 @@ static void url_encode_send(httpd_req_t *req, const char *text) {
     }
 }
 
+static int url_encode_to_buf(char *out, size_t out_len, const char *text) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t pos = 0;
+    for (const unsigned char *p = (const unsigned char *)text; *p != '\0'; p++) {
+        if (pos + 1 >= out_len) return -1;
+        if (isalnum(*p) || *p == '-' || *p == '_' || *p == '.' || *p == '~') {
+            out[pos++] = (char)*p;
+        } else {
+            if (pos + 3 >= out_len) return -1;
+            out[pos++] = '%';
+            out[pos++] = hex[*p >> 4];
+            out[pos++] = hex[*p & 0x0F];
+        }
+    }
+    out[pos] = '\0';
+    return (int)pos;
+}
+
+typedef struct {
+    uint8_t *buf;
+    size_t cap;
+    size_t len;
+} http_capture_t;
+
+static esp_err_t capture_http_event(esp_http_client_event_t *evt) {
+    if (evt->event_id != HTTP_EVENT_ON_DATA || evt->data == NULL || evt->data_len <= 0) return ESP_OK;
+    http_capture_t *capture = (http_capture_t *)evt->user_data;
+    if (capture == NULL || capture->len + (size_t)evt->data_len > capture->cap) return ESP_FAIL;
+    memcpy(capture->buf + capture->len, evt->data, (size_t)evt->data_len);
+    capture->len += (size_t)evt->data_len;
+    return ESP_OK;
+}
+
+static esp_err_t http_get_capture(const char *url, uint8_t *buf, size_t cap, size_t *out_len, int *out_status) {
+    http_capture_t capture = {.buf = buf, .cap = cap, .len = 0};
+    esp_http_client_config_t cfg = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 15000,
+        .crt_bundle_attach = esp_crt_bundle_attach,
+        .event_handler = capture_http_event,
+        .user_data = &capture,
+        .user_agent = USER_AGENT,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    if (client == NULL) return ESP_FAIL;
+    esp_err_t res = esp_http_client_perform(client);
+    if (out_status != NULL) *out_status = esp_http_client_get_status_code(client);
+    esp_http_client_cleanup(client);
+    if (out_len != NULL) *out_len = capture.len;
+    return res;
+}
+
 static int hex_value(char c) {
     if (c >= '0' && c <= '9') return c - '0';
     if (c >= 'a' && c <= 'f') return c - 'a' + 10;
@@ -145,6 +205,47 @@ static bool file_exists(const char *path) {
     return stat(path, &st) == 0 && S_ISREG(st.st_mode);
 }
 
+static esp_err_t delete_recursive(const char *path) {
+    struct stat st;
+    if (stat(path, &st) != 0) return ESP_FAIL;
+    if (S_ISREG(st.st_mode)) return unlink(path) == 0 ? ESP_OK : ESP_FAIL;
+    if (!S_ISDIR(st.st_mode)) return ESP_FAIL;
+
+    DIR *dir = opendir(path);
+    if (dir == NULL) return ESP_FAIL;
+
+    char *child_path = malloc(1024);
+    if (child_path == NULL) {
+        closedir(dir);
+        return ESP_ERR_NO_MEM;
+    }
+
+    esp_err_t res = ESP_OK;
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+        int len = snprintf(child_path, 1024, "%s/%s", path, entry->d_name);
+        if (len < 0 || len >= 1024) {
+            res = ESP_FAIL;
+            break;
+        }
+        res = delete_recursive(child_path);
+        if (res != ESP_OK) break;
+    }
+
+    free(child_path);
+    closedir(dir);
+    if (res != ESP_OK) return res;
+    return rmdir(path) == 0 ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t redirect_to_music_root(httpd_req_t *req) {
+    httpd_resp_set_status(req, "303 See Other");
+    httpd_resp_set_hdr(req, "Location", "/browse/");
+    httpd_resp_sendstr(req, "See /browse/");
+    return ESP_OK;
+}
+
 static esp_err_t list_handler(httpd_req_t *req) {
     char path[1024];
     const char *encoded_rel = req->uri;
@@ -172,8 +273,9 @@ static esp_err_t list_handler(httpd_req_t *req) {
         ".cover{aspect-ratio:1;background:#ddd;display:block;width:100%;object-fit:cover}"
         ".blank{aspect-ratio:1;background:linear-gradient(135deg,#333,#777);display:flex;align-items:center;justify-content:center;color:white;font-size:42px}"
         ".body{padding:12px}.name{font-weight:650;margin-bottom:10px;overflow-wrap:anywhere}.actions{display:flex;gap:8px;flex-wrap:wrap}"
-        ".button{display:inline-block;text-decoration:none;border:1px solid #bbb;border-radius:6px;padding:7px 10px;background:#f8f8f8;color:#111}"
-        ".primary{background:#111;color:#fff;border-color:#111}.list a{display:block;padding:8px 0}</style>"
+        ".button,button{display:inline-block;text-decoration:none;border:1px solid #bbb;border-radius:6px;padding:7px 10px;background:#f8f8f8;color:#111;font:inherit}"
+        ".primary{background:#111;color:#fff;border-color:#111}.danger{border-color:#b22;color:#b22;background:#fff}.list a{display:block;padding:8px 0}"
+        "form{display:inline}.row{display:flex;align-items:center;gap:8px;flex-wrap:wrap;padding:6px 0}</style>"
         "<div class=top><h1>Disc-O-Matsu</h1><small>/sd/Music</small></div>"
     );
 
@@ -183,7 +285,9 @@ static esp_err_t list_handler(httpd_req_t *req) {
         if (*rel == '/') rel++;
         httpd_resp_sendstr_chunk(req, "<p><a class=button href='/browse/'>Back</a> <a class='button primary' href='/album/");
         url_encode_send(req, rel);
-        httpd_resp_sendstr_chunk(req, "'>Download album (.tar)</a></p><div class=list>");
+        httpd_resp_sendstr_chunk(req, "'>Download album (.tar)</a> <form method=post action='/cover/");
+        url_encode_send(req, rel);
+        httpd_resp_sendstr_chunk(req, "'><button type=submit>Find cover</button></form></p><div class=list>");
     } else {
         httpd_resp_sendstr_chunk(req, "<div class=grid>");
     }
@@ -203,8 +307,9 @@ static esp_err_t list_handler(httpd_req_t *req) {
         if (strcmp(path, MUSIC_ROOT) == 0 && S_ISDIR(st.st_mode)) {
             char cover_path[1040];
             snprintf(cover_path, sizeof(cover_path), "%s/cover.jpg", full);
+            bool has_cover = file_exists(cover_path);
             httpd_resp_sendstr_chunk(req, "<article class=album>");
-            if (file_exists(cover_path)) {
+            if (has_cover) {
                 httpd_resp_sendstr_chunk(req, "<img class=cover src='/file/");
                 url_encode_send(req, rel);
                 httpd_resp_sendstr_chunk(req, "/cover.jpg'>");
@@ -217,9 +322,17 @@ static esp_err_t list_handler(httpd_req_t *req) {
             url_encode_send(req, rel);
             httpd_resp_sendstr_chunk(req, "/'>Open</a><a class=button href='/album/");
             url_encode_send(req, rel);
-            httpd_resp_sendstr_chunk(req, "'>Download</a></div></div></article>");
+            httpd_resp_sendstr_chunk(req, "'>Download</a>");
+            if (!has_cover) {
+                httpd_resp_sendstr_chunk(req, "<form method=post action='/cover/");
+                url_encode_send(req, rel);
+                httpd_resp_sendstr_chunk(req, "'><button type=submit>Find cover</button></form>");
+            }
+            httpd_resp_sendstr_chunk(req, "<form method=get action='/delete/");
+            url_encode_send(req, rel);
+            httpd_resp_sendstr_chunk(req, "'><button class=danger type=submit>Delete</button></form></div></div></article>");
         } else {
-            httpd_resp_sendstr_chunk(req, "<a href='");
+            httpd_resp_sendstr_chunk(req, "<div class=row><a href='");
             httpd_resp_sendstr_chunk(req, S_ISDIR(st.st_mode) ? "/browse/" : "/file/");
             url_encode_send(req, rel);
             httpd_resp_sendstr_chunk(req, S_ISDIR(st.st_mode) ? "/'>" : "'>");
@@ -231,13 +344,162 @@ static esp_err_t list_handler(httpd_req_t *req) {
                 snprintf(size, sizeof(size), " <small>%ld MB</small>", (long)((st.st_size + 1024 * 1024 - 1) / (1024 * 1024)));
                 httpd_resp_sendstr_chunk(req, size);
             }
-            httpd_resp_sendstr_chunk(req, "</a>");
+            httpd_resp_sendstr_chunk(req, "</a><form method=get action='/delete/");
+            url_encode_send(req, rel);
+            httpd_resp_sendstr_chunk(req, "'><button class=danger type=submit>Delete</button></form></div>");
         }
     }
     closedir(dir);
     httpd_resp_sendstr_chunk(req, "</div>");
     httpd_resp_sendstr_chunk(req, NULL);
     return ESP_OK;
+}
+
+static esp_err_t delete_confirm_handler(httpd_req_t *req) {
+    char path[1024];
+    const char *encoded_rel = req->uri + strlen("/delete/");
+    if (!build_safe_path(encoded_rel, path, sizeof(path))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad path");
+        return ESP_OK;
+    }
+    trim_trailing_slashes(path);
+    if (strcmp(path, MUSIC_ROOT) == 0) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Refusing to delete Music root");
+        return ESP_OK;
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Not found");
+        return ESP_OK;
+    }
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_sendstr_chunk(
+        req,
+        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Delete</title><style>body{font-family:system-ui,sans-serif;margin:24px;line-height:1.4}"
+        ".button,button{display:inline-block;text-decoration:none;border:1px solid #bbb;border-radius:6px;padding:8px 12px;background:#f8f8f8;color:#111;font:inherit}"
+        ".danger{background:#b22;border-color:#b22;color:#fff}</style><h1>Delete?</h1><p>"
+    );
+    html_escape_send(req, path_basename(path));
+    httpd_resp_sendstr_chunk(req, S_ISDIR(st.st_mode) ? "</p><p>This deletes the whole album folder.</p>" : "</p>");
+    httpd_resp_sendstr_chunk(req, "<form method=post action='/delete/");
+    httpd_resp_sendstr_chunk(req, encoded_rel);
+    httpd_resp_sendstr_chunk(
+        req,
+        "'><button class=danger type=submit>Delete</button> <a class=button href='/browse/'>Cancel</a></form>"
+    );
+    httpd_resp_sendstr_chunk(req, NULL);
+    return ESP_OK;
+}
+
+static esp_err_t delete_post_handler(httpd_req_t *req) {
+    char path[1024];
+    const char *encoded_rel = req->uri + strlen("/delete/");
+    if (!build_safe_path(encoded_rel, path, sizeof(path))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad path");
+        return ESP_OK;
+    }
+    trim_trailing_slashes(path);
+    if (strcmp(path, MUSIC_ROOT) == 0) {
+        httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Refusing to delete Music root");
+        return ESP_OK;
+    }
+
+    esp_err_t res = delete_recursive(path);
+    if (res != ESP_OK) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Delete failed");
+        return ESP_OK;
+    }
+    return redirect_to_music_root(req);
+}
+
+static esp_err_t save_album_cover_from_query(const char *album_dir, const char *query) {
+    uint8_t *buf = malloc(COVER_HTTP_BUF_SIZE);
+    if (buf == NULL) return ESP_ERR_NO_MEM;
+
+    char encoded[512];
+    if (url_encode_to_buf(encoded, sizeof(encoded), query) < 0) {
+        free(buf);
+        return ESP_ERR_INVALID_ARG;
+    }
+
+    char url[768];
+    snprintf(url, sizeof(url), "https://musicbrainz.org/ws/2/release/?fmt=json&limit=1&query=%s", encoded);
+
+    size_t len = 0;
+    int status = 0;
+    esp_err_t res = http_get_capture(url, buf, COVER_HTTP_BUF_SIZE - 1, &len, &status);
+    if (res != ESP_OK || status != 200 || len == 0) {
+        free(buf);
+        return res != ESP_OK ? res : ESP_FAIL;
+    }
+    buf[len] = '\0';
+
+    char release_id[64] = {0};
+    cJSON *root = cJSON_ParseWithLength((const char *)buf, len);
+    cJSON *releases = root != NULL ? cJSON_GetObjectItem(root, "releases") : NULL;
+    cJSON *release = cJSON_IsArray(releases) ? cJSON_GetArrayItem(releases, 0) : NULL;
+    cJSON *id = release != NULL ? cJSON_GetObjectItem(release, "id") : NULL;
+    if (cJSON_IsString(id)) snprintf(release_id, sizeof(release_id), "%s", id->valuestring);
+    if (root != NULL) cJSON_Delete(root);
+    if (release_id[0] == '\0') {
+        free(buf);
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    snprintf(url, sizeof(url), "https://coverartarchive.org/release/%s/front-250", release_id);
+    res = http_get_capture(url, buf, COVER_HTTP_BUF_SIZE, &len, &status);
+    if (res != ESP_OK || status != 200 || len == 0) {
+        free(buf);
+        return res != ESP_OK ? res : ESP_FAIL;
+    }
+
+    char cover_path[1040];
+    int path_len = snprintf(cover_path, sizeof(cover_path), "%s/cover.jpg", album_dir);
+    if (path_len < 0 || path_len >= (int)sizeof(cover_path)) {
+        free(buf);
+        return ESP_FAIL;
+    }
+
+    FILE *f = fopen(cover_path, "wb");
+    if (f == NULL) {
+        free(buf);
+        return ESP_FAIL;
+    }
+    size_t written = fwrite(buf, 1, len, f);
+    int close_res = fclose(f);
+    free(buf);
+    return written == len && close_res == 0 ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t cover_post_handler(httpd_req_t *req) {
+    char path[1024];
+    const char *encoded_rel = req->uri + strlen("/cover/");
+    if (!build_safe_path(encoded_rel, path, sizeof(path))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad path");
+        return ESP_OK;
+    }
+    trim_trailing_slashes(path);
+    if (strcmp(path, MUSIC_ROOT) == 0) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad album");
+        return ESP_OK;
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Album not found");
+        return ESP_OK;
+    }
+
+    esp_err_t res = save_album_cover_from_query(path, path_basename(path));
+    if (res != ESP_OK) {
+        ESP_LOGW(TAG, "Cover lookup failed: %s", esp_err_to_name(res));
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Cover lookup failed");
+        return ESP_OK;
+    }
+    return redirect_to_music_root(req);
 }
 
 static esp_err_t file_handler(httpd_req_t *req) {
@@ -492,10 +754,28 @@ static esp_err_t start_http_server(char *url, size_t url_len) {
         .method = HTTP_GET,
         .handler = album_handler,
     };
+    httpd_uri_t delete_get = {
+        .uri = "/delete/*",
+        .method = HTTP_GET,
+        .handler = delete_confirm_handler,
+    };
+    httpd_uri_t delete_post = {
+        .uri = "/delete/*",
+        .method = HTTP_POST,
+        .handler = delete_post_handler,
+    };
+    httpd_uri_t cover_post = {
+        .uri = "/cover/*",
+        .method = HTTP_POST,
+        .handler = cover_post_handler,
+    };
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &root));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &browse));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &file));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &album));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &delete_get));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &delete_post));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &cover_post));
 
     get_ip_url(url, url_len);
     return ESP_OK;
