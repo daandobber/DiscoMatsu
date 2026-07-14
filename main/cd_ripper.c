@@ -27,6 +27,7 @@ typedef struct {
 
 static SemaphoreHandle_t s_mutex = NULL;
 static cd_ripper_status_t s_status = {0};
+static bool s_task_running = false;
 static volatile bool s_dirty = false;
 static volatile bool s_cancel_requested = false;
 
@@ -44,8 +45,11 @@ static void publish_status(cd_ripper_state_t state, int current_track, int total
     s_dirty = true;
 }
 
-static bool state_is_active(cd_ripper_state_t state) {
-    return state == CD_RIPPER_STATE_MOUNTING_SD || state == CD_RIPPER_STATE_RIPPING;
+static bool rip_task_is_running(void) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    bool running = s_task_running;
+    xSemaphoreGive(s_mutex);
+    return running;
 }
 
 static const char *fallback(const char *s, const char *fb) {
@@ -155,10 +159,13 @@ static esp_err_t rip_one_track(const cdrom_track_t *track, int track_index, int 
     build_file_name(meta, track, track_index, filename, sizeof(filename));
 
     char path[896];
+    char part_path[896];
     snprintf(path, sizeof(path), "%s/%s", album_dir, filename);
+    snprintf(part_path, sizeof(part_path), "%s.part", path);
     publish_status(CD_RIPPER_STATE_RIPPING, audio_ordinal, total_audio, 0, path, NULL);
 
-    FILE *f = fopen(path, "wb");
+    unlink(part_path);
+    FILE *f = fopen(part_path, "wb");
     if (f == NULL) {
         char err[96];
         snprintf(err, sizeof(err), "open failed: errno %d", errno);
@@ -178,10 +185,11 @@ static esp_err_t rip_one_track(const cdrom_track_t *track, int track_index, int 
 
     uint32_t lba = track->start_lba;
     uint32_t done = 0;
+    uint32_t last_percent = 0;
     while (done < sectors) {
         if (s_cancel_requested) {
             fclose(f);
-            unlink(path);
+            unlink(part_path);
             publish_status(CD_RIPPER_STATE_CANCELLED, audio_ordinal, total_audio, (done * 100u) / sectors, path, NULL);
             return ESP_ERR_INVALID_STATE;
         }
@@ -202,11 +210,24 @@ static esp_err_t rip_one_track(const cdrom_track_t *track, int track_index, int 
         }
         lba += chunk;
         done += chunk;
-        publish_status(CD_RIPPER_STATE_RIPPING, audio_ordinal, total_audio, (done * 100u) / sectors, path, NULL);
+        uint32_t percent = (done * 100u) / sectors;
+        if (percent != last_percent) {
+            publish_status(CD_RIPPER_STATE_RIPPING, audio_ordinal, total_audio, percent, path, NULL);
+            last_percent = percent;
+        }
     }
 
     if (fclose(f) != 0) {
         publish_status(CD_RIPPER_STATE_ERROR, audio_ordinal, total_audio, 100, path, "close failed");
+        return ESP_FAIL;
+    }
+
+    unlink(path);
+    if (rename(part_path, path) != 0) {
+        char err[96];
+        snprintf(err, sizeof(err), "rename failed: errno %d", errno);
+        unlink(part_path);
+        publish_status(CD_RIPPER_STATE_ERROR, audio_ordinal, total_audio, 100, path, err);
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "Ripped %s", path);
@@ -270,6 +291,9 @@ static void rip_task(void *arg) {
 
 done:
     s_cancel_requested = false;
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_task_running = false;
+    xSemaphoreGive(s_mutex);
     free(req);
     vTaskDelete(NULL);
 }
@@ -284,7 +308,7 @@ esp_err_t cd_ripper_init(void) {
 esp_err_t cd_ripper_start(const cdrom_status_t *disc, const cd_metadata_status_t *metadata) {
     if (disc == NULL || metadata == NULL || !disc->disc_present || disc->track_count <= 0) return ESP_ERR_INVALID_ARG;
     if (count_audio_tracks(disc) <= 0) return ESP_ERR_INVALID_ARG;
-    if (cd_ripper_is_active()) return ESP_ERR_INVALID_STATE;
+    if (rip_task_is_running()) return ESP_ERR_INVALID_STATE;
     s_cancel_requested = false;
 
     rip_request_t *req = calloc(1, sizeof(rip_request_t));
@@ -292,7 +316,14 @@ esp_err_t cd_ripper_start(const cdrom_status_t *disc, const cd_metadata_status_t
     req->disc = *disc;
     req->meta = *metadata;
 
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
+    s_task_running = true;
+    xSemaphoreGive(s_mutex);
+
     if (xTaskCreate(rip_task, "cd_ripper", 8192, req, 4, NULL) != pdPASS) {
+        xSemaphoreTake(s_mutex, portMAX_DELAY);
+        s_task_running = false;
+        xSemaphoreGive(s_mutex);
         free(req);
         return ESP_FAIL;
     }
@@ -300,7 +331,7 @@ esp_err_t cd_ripper_start(const cdrom_status_t *disc, const cd_metadata_status_t
 }
 
 void cd_ripper_stop(void) {
-    if (!cd_ripper_is_active()) return;
+    if (!rip_task_is_running()) return;
     s_cancel_requested = true;
     s_dirty = true;
 }
@@ -313,10 +344,7 @@ void cd_ripper_get_status(cd_ripper_status_t *out) {
 }
 
 bool cd_ripper_is_active(void) {
-    xSemaphoreTake(s_mutex, portMAX_DELAY);
-    bool active = state_is_active(s_status.state);
-    xSemaphoreGive(s_mutex);
-    return active;
+    return rip_task_is_running();
 }
 
 bool cd_ripper_consume_dirty(void) {

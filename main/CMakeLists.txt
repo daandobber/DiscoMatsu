@@ -2,11 +2,15 @@ idf_build_get_property(idf_target IDF_TARGET)
 if("${idf_target}" STREQUAL "esp32p4")
 list(APPEND extra_requires esp-hosted-tanmatsu)
 endif()
+if("${idf_target}" STREQUAL "esp32p4" OR "${idf_target}" STREQUAL "esp32s2" OR "${idf_target}" STREQUAL "esp32s3")
+list(APPEND usb_srcs "usb_msc_scsi.c")
+list(APPEND usb_requires usb)
+endif()
 
 idf_component_register(
 	SRCS
 		"audio_output.c"
-		"usb_msc_scsi.c"
+		${usb_srcs}
 		"cdrom_audio.c"
 		"cdplayer_task.c"
 		"cd_ripper.c"
@@ -23,7 +27,7 @@ idf_component_register(
 		sdmmc
 		esp_driver_sdmmc
 		badge-bsp
-		usb
+		${usb_requires}
 		esp_driver_i2s
 		esp_rom
 		esp_timer

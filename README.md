@@ -11,7 +11,8 @@ album, track names, and cover art from MusicBrainz.
 - Rip the inserted CD manually with `F3` to WAV files on the SD card under
   `/sd/Music`; press `F3` again while ripping to stop and discard the partial
   track file.
-- Share ripped files manually with `F4` over WiFi from a browser.
+- Share ripped files manually with `F4` over WiFi from a browser, including a
+  whole-album `.tar` download from each album folder.
 - Scrobble playback to Last.fm automatically when Last.fm is configured.
 
 WAV rips use this layout:
@@ -36,7 +37,8 @@ session key in NVS; the password is only used for that login request.
 
 The WiFi file browser is an active mode: press `F4`, wait for the URL shown on
 screen, then open it from another device on the same network. It serves files
-under `/sd/Music` for download and can be stopped with `F4` again.
+under `/sd/Music` for download, offers a whole-album `.tar` link inside album
+folders, and can be stopped with `F4` again.
 
 If Disc ID lookup does not find the inserted CD, open `Esc` -> `Metadata
 search`, type an artist/album query, choose a MusicBrainz release, and the app

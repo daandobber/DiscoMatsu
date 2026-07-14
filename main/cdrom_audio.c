@@ -3,6 +3,9 @@
 #include <inttypes.h>
 #include <string.h>
 
+#include "sdkconfig.h"
+
+#if CONFIG_SOC_USB_OTG_SUPPORTED
 #include "bsp/power.h"
 #include "cd_metadata.h"
 #include "cdplayer_task.h"
@@ -345,3 +348,27 @@ esp_err_t cdrom_audio_eject(void) {
     cd_metadata_clear();
     return ESP_OK;
 }
+#else
+esp_err_t cdrom_audio_init(void) {
+    return ESP_OK;
+}
+
+void cdrom_audio_get_status(cdrom_status_t *out_status) {
+    if (out_status != NULL) memset(out_status, 0, sizeof(*out_status));
+}
+
+bool cdrom_audio_consume_dirty(void) {
+    return false;
+}
+
+esp_err_t cdrom_audio_read_sectors(uint32_t lba, uint16_t sector_count, uint8_t *out_buf) {
+    (void)lba;
+    (void)sector_count;
+    (void)out_buf;
+    return ESP_ERR_NOT_SUPPORTED;
+}
+
+esp_err_t cdrom_audio_eject(void) {
+    return ESP_ERR_NOT_SUPPORTED;
+}
+#endif

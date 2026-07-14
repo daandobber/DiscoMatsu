@@ -17,6 +17,8 @@
 static const char *TAG = "sd_storage";
 
 static sdmmc_card_t *s_card = NULL;
+
+#if defined(CONFIG_BSP_TARGET_TANMATSU) || defined(CONFIG_BSP_TARGET_KONSOOL)
 static sd_pwr_ctrl_handle_t s_pwr = NULL;
 
 static sd_pwr_ctrl_handle_t initialize_sd_ldo(void) {
@@ -59,6 +61,7 @@ static esp_err_t reset_sd_card(void) {
     vTaskDelay(pdMS_TO_TICKS(150));
     return ESP_OK;
 }
+#endif
 
 esp_err_t sd_storage_mount(void) {
     if (s_card != NULL) return ESP_OK;

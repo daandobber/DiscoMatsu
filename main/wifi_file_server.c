@@ -2,8 +2,8 @@
 
 #include <ctype.h>
 #include <dirent.h>
-#include <stdlib.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 
@@ -20,6 +20,7 @@ static const char *TAG = "wifi_file_server";
 
 #define MUSIC_ROOT SD_STORAGE_MOUNT_POINT "/Music"
 #define FILE_CHUNK_SIZE 2048
+#define TAR_BLOCK_SIZE 512
 
 static SemaphoreHandle_t s_mutex = NULL;
 static wifi_file_server_status_t s_status = {0};
@@ -154,6 +155,11 @@ static esp_err_t list_handler(httpd_req_t *req) {
 
     if (strcmp(path, MUSIC_ROOT) != 0) {
         httpd_resp_sendstr_chunk(req, "<a href='/browse/'>../</a>");
+        const char *rel = path + strlen(MUSIC_ROOT);
+        if (*rel == '/') rel++;
+        httpd_resp_sendstr_chunk(req, "<a href='/album/");
+        url_encode_send(req, rel);
+        httpd_resp_sendstr_chunk(req, "'>Download album (.tar)</a><hr>");
     }
 
     struct dirent *entry;
@@ -226,6 +232,164 @@ static esp_err_t file_handler(httpd_req_t *req) {
     return ESP_OK;
 }
 
+static void tar_write_octal(char *dst, size_t len, unsigned long value) {
+    if (len == 0) return;
+    memset(dst, '0', len);
+    dst[len - 1] = '\0';
+    snprintf(dst, len, "%0*lo", (int)len - 2, value);
+    dst[len - 2] = ' ';
+}
+
+static void tar_write_checksum(char *dst, unsigned long value) {
+    snprintf(dst, 8, "%06lo", value);
+    dst[6] = '\0';
+    dst[7] = ' ';
+}
+
+static void tar_fill_name(char header[TAR_BLOCK_SIZE], const char *name) {
+    size_t name_len = strlen(name);
+    if (name_len < 100) {
+        snprintf(header, 100, "%s", name);
+        return;
+    }
+
+    const char *split = NULL;
+    for (const char *p = name; *p != '\0'; p++) {
+        if (*p == '/' && (size_t)(p - name) < 155 && strlen(p + 1) < 100) split = p;
+    }
+    if (split != NULL) {
+        memcpy(header, split + 1, strlen(split + 1));
+        memcpy(header + 345, name, split - name);
+        return;
+    }
+
+    const char *base = strrchr(name, '/');
+    base = base != NULL ? base + 1 : name;
+    snprintf(header, 100, "%.99s", base);
+}
+
+static esp_err_t tar_send_header(httpd_req_t *req, const char *name, const struct stat *st, char typeflag) {
+    char header[TAR_BLOCK_SIZE];
+    memset(header, 0, sizeof(header));
+    tar_fill_name(header, name);
+    tar_write_octal(header + 100, 8, typeflag == '5' ? 0775 : 0664);
+    tar_write_octal(header + 108, 8, 0);
+    tar_write_octal(header + 116, 8, 0);
+    tar_write_octal(header + 124, 12, typeflag == '5' ? 0 : (unsigned long)st->st_size);
+    tar_write_octal(header + 136, 12, (unsigned long)st->st_mtime);
+    memset(header + 148, ' ', 8);
+    header[156] = typeflag;
+    memcpy(header + 257, "ustar", 5);
+    memcpy(header + 263, "00", 2);
+
+    unsigned int checksum = 0;
+    for (size_t i = 0; i < sizeof(header); i++) checksum += (unsigned char)header[i];
+    tar_write_checksum(header + 148, checksum);
+    return httpd_resp_send_chunk(req, header, sizeof(header));
+}
+
+static esp_err_t tar_send_padding(httpd_req_t *req, size_t size) {
+    size_t pad = (TAR_BLOCK_SIZE - (size % TAR_BLOCK_SIZE)) % TAR_BLOCK_SIZE;
+    if (pad == 0) return ESP_OK;
+    char zeros[TAR_BLOCK_SIZE] = {0};
+    return httpd_resp_send_chunk(req, zeros, pad);
+}
+
+static esp_err_t tar_send_file(httpd_req_t *req, const char *path, const char *tar_name, const struct stat *st) {
+    esp_err_t res = tar_send_header(req, tar_name, st, '0');
+    if (res != ESP_OK) return res;
+
+    FILE *f = fopen(path, "rb");
+    if (f == NULL) return ESP_FAIL;
+
+    char *chunk = malloc(FILE_CHUNK_SIZE);
+    if (chunk == NULL) {
+        fclose(f);
+        return ESP_ERR_NO_MEM;
+    }
+
+    size_t read_len;
+    while ((read_len = fread(chunk, 1, FILE_CHUNK_SIZE, f)) > 0) {
+        if (httpd_resp_send_chunk(req, chunk, read_len) != ESP_OK) {
+            free(chunk);
+            fclose(f);
+            return ESP_FAIL;
+        }
+    }
+    free(chunk);
+    fclose(f);
+    return tar_send_padding(req, (size_t)st->st_size);
+}
+
+static esp_err_t tar_send_dir(httpd_req_t *req, const char *path, const char *tar_name) {
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) return ESP_FAIL;
+
+    char dir_name[768];
+    snprintf(dir_name, sizeof(dir_name), "%s/", tar_name);
+    esp_err_t res = tar_send_header(req, dir_name, &st, '5');
+    if (res != ESP_OK) return res;
+
+    DIR *dir = opendir(path);
+    if (dir == NULL) return ESP_FAIL;
+
+    struct dirent *entry;
+    while ((entry = readdir(dir)) != NULL) {
+        if (entry->d_name[0] == '.') continue;
+
+        char child_path[1024];
+        char child_name[768];
+        int path_len = snprintf(child_path, sizeof(child_path), "%s/%s", path, entry->d_name);
+        int name_len = snprintf(child_name, sizeof(child_name), "%s/%s", tar_name, entry->d_name);
+        if (path_len < 0 || path_len >= (int)sizeof(child_path) || name_len < 0 || name_len >= (int)sizeof(child_name)) {
+            continue;
+        }
+
+        struct stat child_st;
+        if (stat(child_path, &child_st) != 0) continue;
+        if (S_ISDIR(child_st.st_mode)) {
+            res = tar_send_dir(req, child_path, child_name);
+        } else if (S_ISREG(child_st.st_mode)) {
+            res = tar_send_file(req, child_path, child_name, &child_st);
+        }
+        if (res != ESP_OK) {
+            closedir(dir);
+            return res;
+        }
+    }
+    closedir(dir);
+    return ESP_OK;
+}
+
+static esp_err_t album_handler(httpd_req_t *req) {
+    char path[1024];
+    const char *encoded_rel = req->uri + strlen("/album/");
+    if (!build_safe_path(encoded_rel, path, sizeof(path))) {
+        httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Bad path");
+        return ESP_OK;
+    }
+
+    struct stat st;
+    if (stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+        httpd_resp_send_err(req, HTTPD_404_NOT_FOUND, "Album not found");
+        return ESP_OK;
+    }
+
+    const char *name = strrchr(path, '/');
+    name = name != NULL ? name + 1 : "album";
+
+    httpd_resp_set_type(req, "application/x-tar");
+    char disposition[280];
+    snprintf(disposition, sizeof(disposition), "attachment; filename=\"%.220s.tar\"", name);
+    httpd_resp_set_hdr(req, "Content-Disposition", disposition);
+
+    if (tar_send_dir(req, path, name) != ESP_OK) return ESP_OK;
+    char zeros[TAR_BLOCK_SIZE * 2] = {0};
+    httpd_resp_send_chunk(req, zeros, sizeof(zeros));
+    httpd_resp_send_chunk(req, NULL, 0);
+    return ESP_OK;
+}
+
 static bool get_ip_url(char *out, size_t out_len) {
     esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
     if (netif != NULL) {
@@ -263,9 +427,15 @@ static esp_err_t start_http_server(char *url, size_t url_len) {
         .method = HTTP_GET,
         .handler = file_handler,
     };
+    httpd_uri_t album = {
+        .uri = "/album/*",
+        .method = HTTP_GET,
+        .handler = album_handler,
+    };
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &root));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &browse));
     ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &file));
+    ESP_ERROR_CHECK(httpd_register_uri_handler(s_server, &album));
 
     get_ip_url(url, url_len);
     return ESP_OK;
