@@ -513,7 +513,29 @@ static esp_err_t save_cover_for_release(const char *album_dir, const char *relea
     return written == jpeg_len && close_res == 0 ? ESP_OK : ESP_FAIL;
 }
 
-static esp_err_t save_album_cover_from_query(const char *album_dir, const char *query) {
+static bool is_release_id_safe(const char *release_id) {
+    size_t len = strlen(release_id);
+    if (len == 0 || len >= 64) return false;
+    for (size_t i = 0; i < len; i++) {
+        char c = release_id[i];
+        if (!(isdigit((unsigned char)c) || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+static esp_err_t save_album_cover_from_release_id(const char *album_dir, const char *release_id) {
+    if (!is_release_id_safe(release_id)) return ESP_ERR_INVALID_ARG;
+
+    uint8_t *buf = malloc(COVER_HTTP_BUF_SIZE);
+    if (buf == NULL) return ESP_ERR_NO_MEM;
+    esp_err_t res = save_cover_for_release(album_dir, release_id, buf);
+    free(buf);
+    return res;
+}
+
+static esp_err_t send_cover_search_results(httpd_req_t *req, const char *rel, const char *query) {
     uint8_t *buf = malloc(COVER_HTTP_BUF_SIZE);
     if (buf == NULL) return ESP_ERR_NO_MEM;
 
@@ -524,7 +546,7 @@ static esp_err_t save_album_cover_from_query(const char *album_dir, const char *
     }
 
     char url[768];
-    snprintf(url, sizeof(url), "https://musicbrainz.org/ws/2/release/?fmt=json&limit=10&query=%s", encoded);
+    snprintf(url, sizeof(url), "https://musicbrainz.org/ws/2/release/?fmt=json&limit=12&query=%s", encoded);
 
     size_t len = 0;
     int status = 0;
@@ -535,23 +557,80 @@ static esp_err_t save_album_cover_from_query(const char *album_dir, const char *
     }
     buf[len] = '\0';
 
-    esp_err_t last_res = ESP_ERR_NOT_FOUND;
     cJSON *root = cJSON_ParseWithLength((const char *)buf, len);
     cJSON *releases = root != NULL ? cJSON_GetObjectItem(root, "releases") : NULL;
-    if (cJSON_IsArray(releases)) {
-        int release_count = cJSON_GetArraySize(releases);
-        for (int i = 0; i < release_count; i++) {
-            cJSON *release = cJSON_GetArrayItem(releases, i);
-            cJSON *id = release != NULL ? cJSON_GetObjectItem(release, "id") : NULL;
-            if (!cJSON_IsString(id)) continue;
-
-            last_res = save_cover_for_release(album_dir, id->valuestring, buf);
-            if (last_res == ESP_OK) break;
-        }
+    if (!cJSON_IsArray(releases) || cJSON_GetArraySize(releases) == 0) {
+        if (root != NULL) cJSON_Delete(root);
+        free(buf);
+        return ESP_ERR_NOT_FOUND;
     }
+
+    httpd_resp_set_type(req, "text/html; charset=utf-8");
+    httpd_resp_sendstr_chunk(
+        req,
+        "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Choose cover</title><style>body{font-family:system-ui,sans-serif;margin:24px;line-height:1.4;background:#f6f5f2;color:#181818}"
+        "input{font:inherit;padding:8px;width:min(520px,100%)}button,.button{font:inherit;padding:8px 12px;border:1px solid #bbb;border-radius:6px;background:#f8f8f8;color:#111;text-decoration:none}"
+        ".grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:14px;margin-top:18px}.card{background:#fff;border:1px solid #ddd;border-radius:8px;overflow:hidden;box-shadow:0 1px 3px #0001}"
+        "img{aspect-ratio:1;width:100%;display:block;object-fit:cover;background:#ddd}.body{padding:10px}.title{font-weight:650;overflow-wrap:anywhere}.meta{color:#555;font-size:14px;margin:4px 0 10px}</style>"
+        "<h1>Choose cover</h1><form method=get action='/cover'><input type=hidden name=path value=\""
+    );
+    html_attr_escape_send(req, rel);
+    httpd_resp_sendstr_chunk(req, "\"><p><input name=q value=\"");
+    html_attr_escape_send(req, query);
+    httpd_resp_sendstr_chunk(req, "\"></p><button type=submit>Search again</button> <a class=button href='/browse/'>Cancel</a></form><div class=grid>");
+
+    int release_count = cJSON_GetArraySize(releases);
+    for (int i = 0; i < release_count; i++) {
+        cJSON *release = cJSON_GetArrayItem(releases, i);
+        cJSON *id = release != NULL ? cJSON_GetObjectItem(release, "id") : NULL;
+        if (!cJSON_IsString(id) || !is_release_id_safe(id->valuestring)) continue;
+
+        cJSON *title = cJSON_GetObjectItem(release, "title");
+        cJSON *date = cJSON_GetObjectItem(release, "date");
+        cJSON *country = cJSON_GetObjectItem(release, "country");
+        cJSON *status_item = cJSON_GetObjectItem(release, "status");
+        cJSON *disambig = cJSON_GetObjectItem(release, "disambiguation");
+        cJSON *score = cJSON_GetObjectItem(release, "score");
+
+        httpd_resp_sendstr_chunk(req, "<article class=card><img src='https://coverartarchive.org/release/");
+        html_attr_escape_send(req, id->valuestring);
+        httpd_resp_sendstr_chunk(req, "/front-250'><div class=body><div class=title>");
+        html_escape_send(req, cJSON_IsString(title) ? title->valuestring : "Unknown release");
+        httpd_resp_sendstr_chunk(req, "</div><div class=meta>");
+        if (cJSON_IsString(date) && date->valuestring[0] != '\0') {
+            html_escape_send(req, date->valuestring);
+        }
+        if (cJSON_IsString(country) && country->valuestring[0] != '\0') {
+            httpd_resp_sendstr_chunk(req, " ");
+            html_escape_send(req, country->valuestring);
+        }
+        if (cJSON_IsString(status_item) && status_item->valuestring[0] != '\0') {
+            httpd_resp_sendstr_chunk(req, " ");
+            html_escape_send(req, status_item->valuestring);
+        }
+        if (cJSON_IsNumber(score)) {
+            char score_text[24];
+            snprintf(score_text, sizeof(score_text), " score %d", score->valueint);
+            httpd_resp_sendstr_chunk(req, score_text);
+        }
+        if (cJSON_IsString(disambig) && disambig->valuestring[0] != '\0') {
+            httpd_resp_sendstr_chunk(req, "<br>");
+            html_escape_send(req, disambig->valuestring);
+        }
+        httpd_resp_sendstr_chunk(req, "</div><form method=get action='/cover'><input type=hidden name=path value=\"");
+        html_attr_escape_send(req, rel);
+        httpd_resp_sendstr_chunk(req, "\"><input type=hidden name=q value=\"");
+        html_attr_escape_send(req, query);
+        httpd_resp_sendstr_chunk(req, "\"><input type=hidden name=release value=\"");
+        html_attr_escape_send(req, id->valuestring);
+        httpd_resp_sendstr_chunk(req, "\"><button type=submit>Use this cover</button></form></div></article>");
+    }
+    httpd_resp_sendstr_chunk(req, "</div>");
+    httpd_resp_sendstr_chunk(req, NULL);
     if (root != NULL) cJSON_Delete(root);
     free(buf);
-    return last_res;
+    return ESP_OK;
 }
 
 static void build_cover_default_query(const char *album_name, char *out, size_t out_len) {
@@ -601,17 +680,25 @@ static esp_err_t cover_get_handler(httpd_req_t *req) {
     char query_string[768];
     char raw_query[256] = {0};
     char query[256] = {0};
+    char raw_release_id[80] = {0};
+    char release_id[80] = {0};
     if (httpd_req_get_url_query_str(req, query_string, sizeof(query_string)) == ESP_OK) {
         if (httpd_query_key_value(query_string, "q", raw_query, sizeof(raw_query)) == ESP_OK) {
             if (!url_decode(raw_query, query, sizeof(query))) {
                 snprintf(query, sizeof(query), "%s", raw_query);
             }
         }
+        if (httpd_query_key_value(query_string, "release", raw_release_id, sizeof(raw_release_id)) == ESP_OK) {
+            if (!url_decode(raw_release_id, release_id, sizeof(release_id))) {
+                snprintf(release_id, sizeof(release_id), "%s", raw_release_id);
+            }
+        }
     }
 
+    const char *rel = path + strlen(MUSIC_ROOT);
+    if (*rel == '/') rel++;
+
     if (query[0] == '\0') {
-        const char *rel = path + strlen(MUSIC_ROOT);
-        if (*rel == '/') rel++;
         httpd_resp_set_type(req, "text/html; charset=utf-8");
         httpd_resp_sendstr_chunk(
             req,
@@ -631,9 +718,11 @@ static esp_err_t cover_get_handler(httpd_req_t *req) {
         return ESP_OK;
     }
 
-    esp_err_t res = save_album_cover_from_query(path, query);
-    if (res != ESP_OK) {
-        ESP_LOGW(TAG, "Cover lookup failed for '%s': %s", query, esp_err_to_name(res));
+    if (release_id[0] == '\0') {
+        esp_err_t res = send_cover_search_results(req, rel, query);
+        if (res == ESP_OK) return ESP_OK;
+
+        ESP_LOGW(TAG, "Cover search failed for '%s': %s", query, esp_err_to_name(res));
         httpd_resp_set_type(req, "text/html; charset=utf-8");
         httpd_resp_sendstr_chunk(
             req,
@@ -642,10 +731,27 @@ static esp_err_t cover_get_handler(httpd_req_t *req) {
             ".button{display:inline-block;padding:8px 12px;border:1px solid #bbb;border-radius:6px;background:#f8f8f8;color:#111;text-decoration:none}</style>"
             "<h1>Cover not found</h1><p>Try a different query, for example the exact album title.</p><p><a class=button href='/cover?path="
         );
-        const char *rel = path + strlen(MUSIC_ROOT);
-        if (*rel == '/') rel++;
         url_encode_send(req, rel);
         httpd_resp_sendstr_chunk(req, "'>Try again</a> <a class=button href='/browse/'>Back</a></p>");
+        httpd_resp_sendstr_chunk(req, NULL);
+        return ESP_OK;
+    }
+
+    esp_err_t res = save_album_cover_from_release_id(path, release_id);
+    if (res != ESP_OK) {
+        ESP_LOGW(TAG, "Cover download failed for '%s': %s", release_id, esp_err_to_name(res));
+        httpd_resp_set_type(req, "text/html; charset=utf-8");
+        httpd_resp_sendstr_chunk(
+            req,
+            "<!doctype html><meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>Cover not found</title><style>body{font-family:system-ui,sans-serif;margin:24px;line-height:1.4}"
+            ".button{display:inline-block;padding:8px 12px;border:1px solid #bbb;border-radius:6px;background:#f8f8f8;color:#111;text-decoration:none}</style>"
+            "<h1>Cover not found</h1><p>Try a different query, for example the exact album title.</p><p><a class=button href='/cover?path="
+        );
+        url_encode_send(req, rel);
+        httpd_resp_sendstr_chunk(req, "&q=");
+        url_encode_send(req, query);
+        httpd_resp_sendstr_chunk(req, "'>Back to results</a> <a class=button href='/browse/'>Back</a></p>");
         httpd_resp_sendstr_chunk(req, NULL);
         return ESP_OK;
     }
