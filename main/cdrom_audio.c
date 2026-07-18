@@ -17,9 +17,10 @@
 
 static const char *TAG = "cdrom_audio";
 
-#define POLL_INTERVAL_MS   2000
-#define SPIN_UP_TIMEOUT_MS 20000  // START STOP UNIT with Immed=0 blocks until the drive is up to speed
-#define TOC_BUF_SIZE       804    // header(4) + up to 99 tracks + lead-out, 8 bytes each
+#define POLL_INTERVAL_MS        2000
+#define SPIN_UP_TIMEOUT_MS      20000  // START STOP UNIT with Immed=0 blocks until the drive is up to speed
+#define USB_POWER_STABILIZE_MS  250    // Let VBUS and high-inrush drives settle before USB enumeration
+#define TOC_BUF_SIZE            804    // header(4) + up to 99 tracks + lead-out, 8 bytes each
 
 static cdrom_status_t s_status = {0};
 static SemaphoreHandle_t s_status_mutex = NULL;
@@ -279,6 +280,10 @@ esp_err_t cdrom_audio_init(void) {
     esp_err_t ret = bsp_power_set_usb_host_boost_enabled(true);
     if (ret != ESP_OK) {
         ESP_LOGW(TAG, "Failed to enable USB host power boost: %s", esp_err_to_name(ret));
+    } else {
+        // The PMIC needs time to enter boost mode. Delaying host startup also
+        // gives optical drives a head start on their relatively heavy inrush.
+        vTaskDelay(pdMS_TO_TICKS(USB_POWER_STABILIZE_MS));
     }
 
     ret = usb_msc_scsi_start(on_msc_ready, on_msc_gone, NULL);

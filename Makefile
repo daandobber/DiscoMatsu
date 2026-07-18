@@ -17,8 +17,8 @@ SDKCONFIG_DEFAULTS ?= sdkconfigs/general;sdkconfigs/$(DEVICE)
 SDKCONFIG ?= sdkconfig_$(DEVICE)
 BADGELINK_DIR ?= badgelink_v020
 BADGELINK_TOOLS ?= $(BADGELINK_DIR)/tools
-APP_SLUG ?= matrixmatsu
-APP_TITLE ?= MatrixMatsu
+APP_SLUG ?= discmatsu
+APP_TITLE ?= Disc-O-Matsu
 APP_VERSION ?= 0
 
 ####
