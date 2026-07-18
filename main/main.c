@@ -10,6 +10,7 @@
 #include "cd_ripper.h"
 #include "cdplayer_task.h"
 #include "cdrom_audio.h"
+#include "dobber_splash.h"
 #include "audio_output.h"
 #include "driver/gpio.h"
 #include "esp_log.h"
@@ -20,6 +21,7 @@
 #include "pax_gfx.h"
 #include "pax_text.h"
 #include "pax_types.h"
+#include "lastfm_config_file.h"
 #include "lastfm_scrobbler.h"
 #include "wifi_file_server.h"
 #include "wifi_setup.h"
@@ -73,6 +75,12 @@ static void blit(void) {
     if (res != ESP_OK) {
         ESP_LOGE(TAG, "Failed to blit to display: %d", res);
     }
+}
+
+static void show_startup_progress(size_t completed, size_t total) {
+    uint8_t percent = total > 0 ? (uint8_t)((completed * 100u) / total) : 100;
+    dobber_splash_render(&fb, percent);
+    blit();
 }
 
 static void measure_font(void) {
@@ -803,17 +811,30 @@ void app_main(void) {
 
     measure_font();
 
-    pax_background(&fb, BLACK);
-    pax_draw_text(&fb, TERM_GREEN, pax_font_sky_mono, FONT_SIZE, 16, 16, "Starting Disc-O-Matsu...");
-    blit();
+    const size_t startup_steps = 8;
+    size_t completed_steps = 0;
+    show_startup_progress(completed_steps, startup_steps);
 
     ESP_ERROR_CHECK(wifi_setup_init());
+    show_startup_progress(++completed_steps, startup_steps);
     ESP_ERROR_CHECK(lastfm_scrobbler_init());
+    show_startup_progress(++completed_steps, startup_steps);
+    esp_err_t config_res = lastfm_config_file_load();
+    if (config_res != ESP_OK && config_res != ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "Optional Last.fm SD config unavailable: %s", esp_err_to_name(config_res));
+    }
+    show_startup_progress(++completed_steps, startup_steps);
     ESP_ERROR_CHECK(cd_metadata_init());
+    show_startup_progress(++completed_steps, startup_steps);
     ESP_ERROR_CHECK(cdrom_audio_init());
+    show_startup_progress(++completed_steps, startup_steps);
     ESP_ERROR_CHECK(cdplayer_task_init());
+    show_startup_progress(++completed_steps, startup_steps);
     ESP_ERROR_CHECK(cd_ripper_init());
+    show_startup_progress(++completed_steps, startup_steps);
     ESP_ERROR_CHECK(wifi_file_server_init());
+    show_startup_progress(++completed_steps, startup_steps);
+    vTaskDelay(pdMS_TO_TICKS(300));
 
     render();
 

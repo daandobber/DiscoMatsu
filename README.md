@@ -36,6 +36,25 @@ https://www.last.fm/api/account/create. Open the in-app menu with `Esc`, choose
 then choose `Login + save`. Disc-O-Matsu stores the API credentials and Last.fm
 session key in NVS; the password is only used for that login request.
 
+As an alternative for first-time setup, create
+`/sd/discomatsu/config.json` on the SD card:
+
+```json
+{
+  "lastfm": {
+    "api_key": "your-api-key",
+    "api_secret": "your-shared-secret",
+    "username": "your-lastfm-username",
+    "password": "your-lastfm-password"
+  }
+}
+```
+
+The file is only used when no Last.fm session is stored in NVS yet. The API
+credentials and resulting session key are saved to NVS; the password is not.
+Keep in mind that the password remains plain text in `config.json` until you
+remove the file from the SD card.
+
 The WiFi file browser is an active mode: press `F4`, wait for the URL shown on
 screen, then open it from another device on the same network. It serves files
 under `/sd/Music` for download, offers a whole-album `.tar` link inside album

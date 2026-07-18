@@ -14,6 +14,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/semphr.h"
 #include "freertos/task.h"
+#include "lwip/apps/sntp.h"
 #include "mbedtls/md5.h"
 #include "nvs.h"
 #include "sdkconfig.h"
@@ -22,6 +23,8 @@
 #define LASTFM_API_URL "https://ws.audioscrobbler.com/2.0/"
 #define LASTFM_HTTP_CAP (32 * 1024)
 #define LASTFM_SCROBBLE_AFTER_SEC 30
+
+static const char *TAG = "lastfm";
 
 #ifndef CONFIG_DISCOMATSU_LASTFM_API_KEY
 #define CONFIG_DISCOMATSU_LASTFM_API_KEY ""
@@ -48,6 +51,7 @@ typedef struct {
     char api_secret[80];
     int track_number;
     uint32_t duration_sec;
+    uint32_t elapsed_sec;
     uint32_t timestamp;
 } lastfm_request_t;
 
@@ -65,6 +69,7 @@ static char s_api_secret[80]     = CONFIG_DISCOMATSU_LASTFM_API_SECRET;
 static char s_last_error[96]     = "";
 static bool s_scrobbled_current  = false;
 static volatile bool s_dirty     = false;
+static bool s_sntp_started       = false;
 
 static bool api_configured(void) {
     return s_api_key[0] != '\0' && s_api_secret[0] != '\0';
@@ -77,6 +82,7 @@ static void set_error(const char *fmt, ...) {
     vsnprintf(s_last_error, sizeof(s_last_error), fmt, args);
     xSemaphoreGive(s_mutex);
     va_end(args);
+    ESP_LOGE(TAG, "%s", s_last_error);
     s_dirty = true;
 }
 
@@ -84,6 +90,13 @@ static void set_session(const char *username, const char *session_key) {
     xSemaphoreTake(s_mutex, portMAX_DELAY);
     snprintf(s_username, sizeof(s_username), "%s", username ? username : "");
     snprintf(s_session_key, sizeof(s_session_key), "%s", session_key ? session_key : "");
+    s_last_error[0] = '\0';
+    xSemaphoreGive(s_mutex);
+    s_dirty = true;
+}
+
+static void clear_error(void) {
+    xSemaphoreTake(s_mutex, portMAX_DELAY);
     s_last_error[0] = '\0';
     xSemaphoreGive(s_mutex);
     s_dirty = true;
@@ -215,24 +228,111 @@ static void sign_auth(const lastfm_request_t *req, char out[33]) {
     md5_hex(sig_src, out);
 }
 
+static size_t append_sig_pair(char *out, size_t cap, size_t pos, const char *key, const char *value) {
+    int written = snprintf(out + pos, cap - pos, "%s%s", key, value ? value : "");
+    return written < 0 || (size_t)written >= cap - pos ? cap : pos + (size_t)written;
+}
+
+static size_t append_sig_u32(char *out, size_t cap, size_t pos, const char *key, uint32_t value) {
+    char text[16];
+    snprintf(text, sizeof(text), "%u", (unsigned)value);
+    return append_sig_pair(out, cap, pos, key, text);
+}
+
 static void sign_track(const lastfm_request_t *req, char out[33]) {
-    char sig_src[768];
+    char sig_src[768] = "";
+    size_t pos = 0;
+    pos = append_sig_pair(sig_src, sizeof(sig_src), pos, "album", req->album);
+    pos = append_sig_pair(sig_src, sizeof(sig_src), pos, "api_key", req->api_key);
+    pos = append_sig_pair(sig_src, sizeof(sig_src), pos, "artist", req->artist);
+    if (req->duration_sec > 0) pos = append_sig_u32(sig_src, sizeof(sig_src), pos, "duration", req->duration_sec);
+    pos = append_sig_pair(sig_src, sizeof(sig_src), pos, "method", req->method);
+    pos = append_sig_pair(sig_src, sizeof(sig_src), pos, "sk", req->session_key);
     if (strcmp(req->method, "track.scrobble") == 0) {
-        snprintf(
-            sig_src, sizeof(sig_src),
-            "album%sapi_key%sartist%sduration%umethodtrack.scrobblesk%stimestamp%utrack%strackNumber%d%s",
-            req->album, req->api_key, req->artist, (unsigned)req->duration_sec, req->session_key,
-            (unsigned)req->timestamp, req->track, req->track_number, req->api_secret
-        );
-    } else {
-        snprintf(
-            sig_src, sizeof(sig_src),
-            "album%sapi_key%sartist%sduration%umethodtrack.updateNowPlayingsk%strack%strackNumber%d%s",
-            req->album, req->api_key, req->artist, (unsigned)req->duration_sec, req->session_key, req->track,
-            req->track_number, req->api_secret
-        );
+        pos = append_sig_u32(sig_src, sizeof(sig_src), pos, "timestamp", req->timestamp);
     }
+    pos = append_sig_pair(sig_src, sizeof(sig_src), pos, "track", req->track);
+    if (req->track_number > 0) {
+        pos = append_sig_u32(sig_src, sizeof(sig_src), pos, "trackNumber", (uint32_t)req->track_number);
+    }
+    append_sig_pair(sig_src, sizeof(sig_src), pos, "", req->api_secret);
     md5_hex(sig_src, out);
+}
+
+static bool ensure_time_valid(void) {
+    time_t now = time(NULL);
+    if (now >= 1600000000) return true;
+
+    if (!s_sntp_started) {
+        sntp_setoperatingmode(SNTP_OPMODE_POLL);
+        sntp_setservername(0, "pool.ntp.org");
+        sntp_init();
+        s_sntp_started = true;
+    }
+
+    for (int i = 0; i < 50; i++) {
+        vTaskDelay(pdMS_TO_TICKS(200));
+        now = time(NULL);
+        if (now >= 1600000000) return true;
+    }
+    return false;
+}
+
+static int json_integer(cJSON *value, int fallback) {
+    if (cJSON_IsNumber(value)) return value->valueint;
+    if (cJSON_IsString(value) && value->valuestring) return atoi(value->valuestring);
+    return fallback;
+}
+
+static void handle_track_response(const lastfm_request_t *req, const uint8_t *buf, size_t len) {
+    cJSON *root = cJSON_ParseWithLength((const char *)buf, len);
+    cJSON *api_error = root ? cJSON_GetObjectItem(root, "error") : NULL;
+    cJSON *api_message = root ? cJSON_GetObjectItem(root, "message") : NULL;
+    if (cJSON_IsNumber(api_error)) {
+        set_error(
+            "lastfm %d %.64s", api_error->valueint,
+            cJSON_IsString(api_message) ? api_message->valuestring : ""
+        );
+        if (strcmp(req->method, "track.scrobble") == 0) s_scrobbled_current = false;
+        if (root) cJSON_Delete(root);
+        return;
+    }
+
+    if (strcmp(req->method, "track.updateNowPlaying") == 0) {
+        if (root) {
+            clear_error();
+            ESP_LOGI(TAG, "Now playing accepted: %s - %s", req->artist, req->track);
+        } else {
+            set_error("now playing response");
+        }
+        if (root) cJSON_Delete(root);
+        return;
+    }
+
+    cJSON *scrobbles = root ? cJSON_GetObjectItem(root, "scrobbles") : NULL;
+    cJSON *scrobble = scrobbles ? cJSON_GetObjectItem(scrobbles, "scrobble") : NULL;
+    cJSON *ignored = scrobble ? cJSON_GetObjectItem(scrobble, "ignoredMessage") : NULL;
+    cJSON *ignored_code = cJSON_IsObject(ignored) ? cJSON_GetObjectItem(ignored, "code") : NULL;
+    cJSON *ignored_text_value = cJSON_IsObject(ignored) ? cJSON_GetObjectItem(ignored, "#text") : NULL;
+    const char *ignored_text = cJSON_IsString(ignored) ? ignored->valuestring
+                                                      : (cJSON_IsString(ignored_text_value)
+                                                             ? ignored_text_value->valuestring
+                                                             : "");
+    int code = json_integer(ignored_code, 0);
+    cJSON *attributes = scrobbles ? cJSON_GetObjectItem(scrobbles, "@attr") : NULL;
+    int accepted = json_integer(attributes ? cJSON_GetObjectItem(attributes, "accepted") : NULL, -1);
+    int ignored_count = json_integer(attributes ? cJSON_GetObjectItem(attributes, "ignored") : NULL, 0);
+    if ((ignored_text != NULL && ignored_text[0] != '\0') || code != 0) {
+        set_error("scrobble ignored %d %.56s", code, ignored_text);
+        s_scrobbled_current = false;
+    } else if (scrobble != NULL && accepted != 0 && ignored_count == 0) {
+        clear_error();
+        ESP_LOGI(TAG, "Scrobble accepted: %s - %s", req->artist, req->track);
+    } else {
+        set_error("scrobble rejected accepted=%d ignored=%d", accepted, ignored_count);
+        s_scrobbled_current = false;
+    }
+    if (root) cJSON_Delete(root);
 }
 
 static int append_pair(char *body, size_t cap, size_t pos, const char *key, const char *value) {
@@ -253,14 +353,28 @@ static void request_task(void *arg) {
     uint8_t *buf = heap_caps_malloc(LASTFM_HTTP_CAP, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
     if (buf == NULL) {
         set_error("no http buffer");
+        if (strcmp(req->method, "track.scrobble") == 0) s_scrobbled_current = false;
         free(req);
         vTaskDelete(NULL);
         return;
     }
 
+    ESP_LOGI(TAG, "Sending %s: %s - %s", req->method, req->artist, req->track);
     if (!wifi_setup_connect_blocking(15000)) {
         set_error("no wifi");
+        if (strcmp(req->method, "track.scrobble") == 0) s_scrobbled_current = false;
         goto done;
+    }
+
+    if (strcmp(req->method, "track.scrobble") == 0) {
+        if (!ensure_time_valid()) {
+            set_error("no time sync");
+            s_scrobbled_current = false;
+            goto done_wifi;
+        }
+        time_t now = time(NULL);
+        req->timestamp = (uint32_t)now;
+        if (req->timestamp > req->elapsed_sec) req->timestamp -= req->elapsed_sec;
     }
 
     char api_sig[33];
@@ -281,8 +395,10 @@ static void request_task(void *arg) {
         pos = append_pair(body, sizeof(body), pos, "artist", req->artist);
         pos = append_pair(body, sizeof(body), pos, "track", req->track);
         pos = append_pair(body, sizeof(body), pos, "album", req->album);
-        pos = append_pair_u32(body, sizeof(body), pos, "duration", req->duration_sec);
-        pos = append_pair_u32(body, sizeof(body), pos, "trackNumber", (uint32_t)req->track_number);
+        if (req->duration_sec > 0) pos = append_pair_u32(body, sizeof(body), pos, "duration", req->duration_sec);
+        if (req->track_number > 0) {
+            pos = append_pair_u32(body, sizeof(body), pos, "trackNumber", (uint32_t)req->track_number);
+        }
         if (strcmp(req->method, "track.scrobble") == 0) {
             pos = append_pair_u32(body, sizeof(body), pos, "timestamp", req->timestamp);
         }
@@ -299,8 +415,10 @@ static void request_task(void *arg) {
     size_t len = 0;
     int status = 0;
     esp_err_t res = http_post_form(body, buf, LASTFM_HTTP_CAP, &len, &status);
+    ESP_LOGI(TAG, "%s HTTP %d, %u bytes", req->method, status, (unsigned)len);
     if (res != ESP_OK || status != 200) {
         set_error("http %s/%d", esp_err_to_name(res), status);
+        if (strcmp(req->method, "track.scrobble") == 0) s_scrobbled_current = false;
         goto done_wifi;
     }
 
@@ -316,7 +434,7 @@ static void request_task(void *arg) {
         }
         if (root) cJSON_Delete(root);
     } else {
-        set_error("");
+        handle_track_response(req, buf, len);
     }
 
 done_wifi:
@@ -345,7 +463,6 @@ static bool fill_track_request(lastfm_request_t *req, const char *method, const 
     snprintf(req->track, sizeof(req->track), "%s", track->track);
     req->track_number = track->track_number;
     req->duration_sec = track->duration_sec;
-    req->timestamp = (uint32_t)time(NULL);
     return true;
 }
 
@@ -423,7 +540,10 @@ void lastfm_scrobbler_now_playing(const lastfm_track_info_t *track) {
         free(req);
         return;
     }
-    xTaskCreate(request_task, "lastfm_now", 12288, req, 3, NULL);
+    if (xTaskCreate(request_task, "lastfm_now", 12288, req, 3, NULL) != pdPASS) {
+        free(req);
+        set_error("now playing task");
+    }
 }
 
 void lastfm_scrobbler_maybe_scrobble(const lastfm_track_info_t *track, uint32_t elapsed_sec) {
@@ -439,14 +559,13 @@ void lastfm_scrobbler_maybe_scrobble(const lastfm_track_info_t *track, uint32_t 
         free(req);
         return;
     }
-    if (req->timestamp < 1600000000u) {
-        free(req);
-        return;
-    }
-    // Last.fm wants the start time, not the time we crossed the threshold.
-    if (req->timestamp > elapsed_sec) req->timestamp -= elapsed_sec;
+    req->elapsed_sec = elapsed_sec;
     s_scrobbled_current = true;
-    xTaskCreate(request_task, "lastfm_scrob", 12288, req, 3, NULL);
+    if (xTaskCreate(request_task, "lastfm_scrob", 12288, req, 3, NULL) != pdPASS) {
+        s_scrobbled_current = false;
+        free(req);
+        set_error("scrobble task");
+    }
 }
 
 void lastfm_scrobbler_track_changed(void) {

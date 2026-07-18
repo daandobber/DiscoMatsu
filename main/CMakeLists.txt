@@ -14,10 +14,12 @@ idf_component_register(
 		"cdrom_audio.c"
 		"cdplayer_task.c"
 		"cd_ripper.c"
+		"dobber_splash.c"
 		"sd_storage.c"
 		"wifi_setup.c"
 		"wifi_file_server.c"
 		"cd_metadata.c"
+		"lastfm_config_file.c"
 		"lastfm_scrobbler.c"
 		"main.c"
 	PRIV_REQUIRES
